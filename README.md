@@ -26,6 +26,8 @@ All drawing lives in a small embedded Java view, so no Python runs per frame. It
 
 On a Pixel 6 Pro in a busy forum topic, scrolling stayed the same with it on and off (median frame 29 ms on, 26 ms off; janky frames 23% on, 41% off), and idle CPU stayed within the normal swing of the app.
 
+The header rain redraws at most 16 times a second with fewer streams. On the 6 Pro the chat list screen used about 8% of one CPU core more with it on, because the app's glass effects redraw with every frame. It stops the moment you leave the chat list.
+
 ## How it differs from Custom Snow's Matrix mode
 
 Custom Snow scatters single green characters as particles over the header. Digital Rain draws real falling columns, leading glyphs and fading trails behind your chats and the header, so it replaces Custom Snow. Where the rain is on, holiday snow is not drawn over it.

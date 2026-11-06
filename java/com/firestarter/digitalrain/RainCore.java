@@ -9,6 +9,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.os.Looper;
 import android.view.Choreographer;
 import android.view.View;
 import android.view.ViewGroup;
@@ -44,8 +45,14 @@ public final class RainCore {
         }
     }
 
+    static boolean offMain(final ViewGroup g, final boolean header) {
+        if (Looper.myLooper() == Looper.getMainLooper()) return false;
+        g.post(new Runnable() { public void run() { if (header) attachHeader(g); else attach(g); } });
+        return true;
+    }
+
     public static void attach(ViewGroup content) {
-        if (content == null) return;
+        if (content == null || offMain(content, false)) return;
         for (int i = 0; i < content.getChildCount(); i++) if (content.getChildAt(i) instanceof RainView) return;
         int idx = 0;
         try {
@@ -63,6 +70,22 @@ public final class RainCore {
         RainView v = new RainView(content.getContext());
         content.addView(v, idx, new FrameLayout.LayoutParams(-1, -1));
         views.add(new WeakReference<>(v));
+    }
+
+    /** Rain behind a header (an ActionBar): first child, so the title and icons draw on top; dimmer. */
+    public static void attachHeader(ViewGroup bar) {
+        if (bar == null || offMain(bar, true)) return;
+        for (int i = 0; i < bar.getChildCount(); i++) if (bar.getChildAt(i) instanceof RainView) return;
+        RainView v = new RainView(bar.getContext());
+        v.dim = 0.55f;
+        bar.addView(v, 0, new FrameLayout.LayoutParams(-1, -1));
+        views.add(new WeakReference<>(v));
+    }
+
+    public static boolean hasRain(ViewGroup g) {
+        if (g == null) return false;
+        for (int i = 0; i < g.getChildCount(); i++) if (g.getChildAt(i) instanceof RainView) return true;
+        return false;
     }
 
     public static void detachAll() {
@@ -97,6 +120,7 @@ public final class RainCore {
         long t0, lastDraw;
         int seenVersion = -1;
         float last = -1;
+        float dim = 1f;
 
         RainView(Context c) { super(c); setWillNotDraw(false); setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO); }
 
@@ -169,6 +193,8 @@ public final class RainCore {
             seenVersion = cfgVersion;
             if (cols == 0) return;
             int n = count;
+            // a header holds a few rows: scale the streams to its height (a phone screen is about 60 rows)
+            if (dim < 1f) n = Math.max(12, count * rows / 30);
             headY = new float[n]; speed = new float[n]; col = new int[n]; len = new int[n]; lastRow = new int[n];
             for (int i = 0; i < n; i++) spawn(i, true);
             ensureBuffers();
@@ -202,7 +228,7 @@ public final class RainCore {
             posted = false;
             if (!running) return;
             if (getWindowVisibility() != VISIBLE || !isShown()) { running = false; return; }
-            if (nanos - lastDraw >= 41_000_000L) { lastDraw = nanos; invalidate(); }
+            if (nanos - lastDraw >= (dim < 1f ? 62_000_000L : 41_000_000L)) { lastDraw = nanos; invalidate(); }
             posted = true;
             Choreographer.getInstance().postFrameCallback(this);
         }
@@ -243,7 +269,7 @@ public final class RainCore {
             // glow behind the leading glyphs
             for (int i = 0; i < n; i++) {
                 int r = lastRow[i];
-                if (r >= 0 && r < rows) quad(glyph[r * cols + col[i]], col[i], r, 1, Color.argb(170, br, bgc, bb), gw, gh);
+                if (r >= 0 && r < rows) quad(glyph[r * cols + col[i]], col[i], r, 1, Color.argb((int) (170 * dim), br, bgc, bb), gw, gh);
             }
             // trails: bright just behind the head, fading into dark color
             for (int i = 0; i < n; i++) {
@@ -259,7 +285,7 @@ public final class RainCore {
                     float b = 1f - age / life;
                     float lum = 0.22f + 0.78f * b * b;
                     float lift = b > 0.85f ? (b - 0.85f) * 1.1f : 0f;
-                    int a = (int) (30 + 225 * b);
+                    int a = (int) ((30 + 225 * b) * dim);
                     int cr = (int) Math.min(255, br * lum + 255 * lift);
                     int cg = (int) Math.min(255, bgc * lum + 255 * lift);
                     int cb = (int) Math.min(255, bb * lum + 255 * lift);
@@ -267,7 +293,7 @@ public final class RainCore {
                 }
             }
             // leading glyphs: white tinted with the base color
-            int head = Color.argb(255, 225 + br / 9, 235 + bgc / 13, 225 + bb / 9);
+            int head = Color.argb((int) (255 * dim), 225 + br / 9, 235 + bgc / 13, 225 + bb / 9);
             for (int i = 0; i < n; i++) {
                 int r = lastRow[i];
                 if (r >= 0 && r < rows) quad(glyph[r * cols + col[i]], col[i], r, 0, head, gw, gh);

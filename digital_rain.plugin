@@ -1,0 +1,391 @@
+__id__ = "digital_rain"
+__name__ = "Digital Rain"
+__description__ = "Movie style digital rain as the chat background: mirrored katakana, digits and symbols falling in columns at different speeds, a bright white leading glyph with a soft glow, trails that fade to dark, and glyphs that flicker inside the trails. Pick any color by hex or slider, rotate through colors, and set the rain speed, color rotation speed and particle count. Made by [firestarter1996](https://github.com/firestarter1996)."
+__author__ = "firestarter1996"
+__version__ = "1.0.0"
+__min_version__ = "12.5.1"
+
+# Performance first: all drawing lives in a small embedded Java view (no Python per frame).
+# It runs on vsync only while its chat is on screen and the screen is on, redraws at most
+# 30 times a second, allocates nothing per frame and draws glyphs from two atlases built once.
+# Python only runs when a chat opens and when a setting changes.
+# Logcat tag: DigitalRain.
+
+import base64
+import zlib
+
+from java import jclass, dynamic_proxy
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from client_utils import get_last_fragment
+from ui.settings import Header, Switch, Divider, Input, Custom, Text
+
+ENTRY = "com.firestarter.digitalrain.RainCore"
+DEFAULT_HEX = "#00FF41"
+
+
+def _log(msg):
+    try:
+        jclass("android.util.Log").d("DigitalRain", str(msg))
+    except Exception:
+        pass
+
+
+def _jint(v):
+    v = int(v) & 0xFFFFFFFF
+    return v - 0x100000000 if v >= 0x80000000 else v
+
+
+def _parse_hex(s):
+    s = str(s or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if len(s) != 6:
+        return None
+    try:
+        return int(s, 16)
+    except ValueError:
+        return None
+
+
+class DigitalRainPlugin(BasePlugin):
+
+    def on_plugin_load(self):
+        self.core = None
+        self.rows = {}
+        self.refs = []
+        try:
+            self._load_core()
+            self._sync()
+        except Exception as e:
+            _log("load: %s" % e)
+            return
+        ca_cls = find_class("org.telegram.ui.ChatActivity")
+        ctx_cls = find_class("android.content.Context")
+        plugin = self
+
+        class CreateViewHook(MethodHook):
+            def after_hooked_method(self, param):
+                plugin._attach(param.thisObject)
+
+        self.hook_method(ca_cls.getDeclaredMethod("createView", ctx_cls), CreateViewHook())
+        # a chat already open when the plugin loads gets the rain right away
+        try:
+            f = get_last_fragment()
+            if f is not None and ca_cls.isInstance(f):
+                self._attach(f)
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        try:
+            if self.core is not None:
+                self._call("detachAll")
+        except Exception as e:
+            _log("unload: %s" % e)
+
+    # ---- core --------------------------------------------------------------------
+
+    def _load_core(self):
+        ctx = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+        with open(__file__, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        block = text.rsplit("# __DEX_BEGIN__", 1)[1].split("# __DEX_END__", 1)[0]
+        payload = "".join(l.strip()[1:].strip() for l in block.splitlines() if l.strip().startswith("#"))
+        data = zlib.decompress(base64.b64decode(payload))
+        ByteBuffer = jclass("java.nio.ByteBuffer")
+        Loader = jclass("dalvik.system.InMemoryDexClassLoader")
+        self.loader = Loader(ByteBuffer.wrap(data), ctx.getClassLoader())
+        self.core = self.loader.loadClass(ENTRY)
+        self.methods = {}
+        for m in self.core.getDeclaredMethods():
+            self.methods[str(m.getName())] = m
+
+    def _call(self, name, *args):
+        return self.methods[name].invoke(None, *args)
+
+    def _attach(self, chat):
+        if not bool(self.get_setting("enabled", True)) or self.core is None:
+            return
+        try:
+            content = get_private_field(chat, "contentView")
+            if content is not None:
+                self._call("attach", content)
+        except Exception as e:
+            _log("attach: %s" % e)
+
+    def _color(self):
+        c = _parse_hex(self.get_setting("color", DEFAULT_HEX))
+        return 0x00FF41 if c is None else c
+
+    def _num(self, key, default):
+        try:
+            return float(self.get_setting(key, default))
+        except Exception:
+            return float(default)
+
+    def _sync(self, *_):
+        if self.core is None:
+            return
+        Integer = jclass("java.lang.Integer")
+        Boolean = jclass("java.lang.Boolean")
+        Float = jclass("java.lang.Float")
+        try:
+            self._call("setConfig",
+                       Integer(_jint(0xFF000000 | self._color())),
+                       Boolean(bool(self.get_setting("rotate", False))),
+                       Float(self._num("rot_speed", 20)),
+                       Float(self._num("rain_speed", 1.0)),
+                       Integer(int(self._num("count", 80))))
+        except Exception as e:
+            _log("sync: %s" % e)
+
+    def _on_enabled(self, value):
+        if self.core is None:
+            return
+        if value:
+            try:
+                f = get_last_fragment()
+                if f is not None and find_class("org.telegram.ui.ChatActivity").isInstance(f):
+                    self._attach(f)
+            except Exception:
+                pass
+        else:
+            self._call("detachAll")
+
+    def _on_hex(self, value):
+        c = _parse_hex(value)
+        if c is not None:
+            self.set_setting("color", "#%06X" % c)
+            r = self.rows.get("hue")
+            if r is not None:
+                r[1]()
+        self._sync()
+
+    # ---- settings ------------------------------------------------------------------
+
+    def _slider(self, ctx, key, title, default, lo, hi, fmt, on_value=None, get_value=None):
+        LinearLayout = jclass("android.widget.LinearLayout")
+        TextView = jclass("android.widget.TextView")
+        Gravity = jclass("android.view.Gravity")
+        AU = jclass("org.telegram.messenger.AndroidUtilities")
+        Theme = jclass("org.telegram.ui.ActionBar.Theme")
+        SeekBarView = jclass("org.telegram.ui.Components.SeekBarView")
+        LayoutHelper = jclass("org.telegram.ui.Components.LayoutHelper")
+        plugin = self
+        get = get_value or (lambda: self._num(key, default))
+
+        root = LinearLayout(ctx)
+        root.setOrientation(LinearLayout.VERTICAL)
+        root.setPadding(AU.dp(21), AU.dp(10), AU.dp(21), AU.dp(12))
+        row = LinearLayout(ctx)
+        row.setOrientation(LinearLayout.HORIZONTAL)
+        row.setGravity(Gravity.CENTER_VERTICAL)
+        t = TextView(ctx)
+        t.setText(title)
+        t.setTextSize(16)
+        t.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText))
+        row.addView(t, LinearLayout.LayoutParams(0, -2, 1.0))
+        v = TextView(ctx)
+        v.setTextSize(14)
+        v.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
+        v.setTypeface(AU.bold())
+        v.setText(fmt(get()))
+        row.addView(v, LayoutHelper.createLinear(-2, -2))
+        root.addView(row, LayoutHelper.createLinear(-1, -2))
+        bar = SeekBarView(ctx)
+        bar.setReportChanges(True)
+        root.addView(bar, LayoutHelper.createLinear(-1, 38, 0, 2, 0, 0, 0))
+        dcls = jclass("org.telegram.ui.Components.SeekBarView$SeekBarViewDelegate")
+
+        class D(dynamic_proxy(dcls)):
+            def onSeekBarDrag(this, stop, progress):
+                val = lo + (hi - lo) * float(progress)
+                if on_value is not None:
+                    on_value(val)
+                else:
+                    plugin.set_setting(key, ("%.1f" % val) if hi - lo < 20 else str(int(round(val))))
+                v.setText(fmt(val))
+                plugin._sync()
+
+            def onSeekBarPressed(this, pressed):
+                return None
+
+            def getContentDescription(this):
+                return title
+
+            def getStepsCount(this):
+                return 0
+
+            def needVisuallyDivideSteps(this):
+                return False
+
+        d = D()
+        self.refs.append(d)
+        bar.setDelegate(d)
+
+        def refresh():
+            cur = get()
+            v.setText(fmt(cur))
+            bar.setProgress(float((cur - lo) / (hi - lo)))
+
+        refresh()
+        self.rows[key] = (root, refresh)
+        return root
+
+    def _hue(self):
+        Color = jclass("android.graphics.Color")
+        hsv = jclass("java.lang.reflect.Array").newInstance(jclass("java.lang.Float").TYPE, 3)
+        Color.colorToHSV(_jint(0xFF000000 | self._color()), hsv)
+        return float(hsv[0])
+
+    def _set_hue(self, h):
+        Color = jclass("android.graphics.Color")
+        c = int(Color.HSVToColor([float(h), 1.0, 1.0])) & 0xFFFFFF
+        self.set_setting("color", "#%06X" % c)
+
+    def create_settings(self):
+        items = [
+            Switch(key="enabled", text="Digital Rain", default=True, on_change=self._on_enabled,
+                   subtext="Movie style rain behind every chat"),
+            Header(text="Color"),
+            Input(key="color", text="Color hex", default=DEFAULT_HEX, on_change=self._on_hex,
+                  subtext="Film green is #00FF41"),
+        ]
+        ctx = None
+        try:
+            f = get_last_fragment()
+            ctx = f.getParentActivity() if f is not None else None
+        except Exception:
+            pass
+        UItem = jclass("org.telegram.ui.Components.UItem")
+
+        def custom(key, view):
+            return Custom(item=UItem.asCustom(_jint(zlib.crc32(key.encode()) & 0x7FFFFFFF), view))
+
+        if ctx is not None:
+            try:
+                self.rows = {}
+                items.append(custom("hue", self._slider(
+                    ctx, "hue", "Color slider", 135, 0.0, 360.0,
+                    lambda h: str(self.get_setting("color", DEFAULT_HEX)).upper(),
+                    on_value=self._set_hue, get_value=self._hue)))
+            except Exception as e:
+                _log("hue row: %s" % e)
+        items.append(Switch(key="rotate", text="Rotate through colors", default=False, on_change=self._sync))
+        if ctx is not None:
+            try:
+                items.append(custom("rot_speed", self._slider(ctx, "rot_speed", "Color rotation speed", 20, 1.0, 120.0,
+                                                              lambda x: "%d° a second" % int(round(x)))))
+                items.append(Header(text="Rain"))
+                items.append(custom("rain_speed", self._slider(ctx, "rain_speed", "Rain speed", 1.0, 0.2, 3.0,
+                                                               lambda x: "%.1fx" % x)))
+                items.append(custom("count", self._slider(ctx, "count", "Particle count", 80, 10.0, 300.0,
+                                                          lambda x: "%d streams" % int(round(x)))))
+            except Exception as e:
+                _log("rows: %s" % e)
+        items.append(Divider(text="Draws only while a chat is on screen, at most 24 times a second, and stops when the screen is off."))
+        return items
+
+
+# Compiled RainCore (java/ in the repo), zlib + base64
+# __DEX_BEGIN__
+# eNqNew18lNWZ73Pe952PTOYrM5MPAiSTSdDhIyQkBAIJkBAIYMLXZEhLoCtvkkkyOryTzEwg1q6GYItaUcuqFdfadndB2boVwY+2
+# muhKi2hl16u2NxdpV3p7rdfu3WFv93b763Wb+z/nPYEgtnczv//7POc5z/l+znOe886kNzbiqK6tpw9XZVqO+k+/+cTRL3z444mX
+# 1r2ZisSSv366ZHQJ0SARjXQu9ZH8O1lN9Gsy5fXAHI1oDegnoFWgl21ESdCBHCIV9AMnUVMF4CK6IUQ0H1gM1ANNQCuwHYgCu4E9
+# QD9wC2AAQ8A+4A7gXuAw8DXgYeAx4NvAMeAp4DvAM8BzwA+ACeA14GfAH4BgOVEDsBu4C3gSOA98BCjoYxnQDOwC7gQeA14Efgoo
+# 81AeqAN2A/uArwEvAx8ChTdgHoAe4G7gKeDHwMfAfwCeG4mWAOuBXUASuBd4AhgHLgL/DrjDRPOABmAr0AV0A0PA7cBXgHuAw8BD
+# wFHgG8BfASeA08D3gHHgR8AbwHngPeAC8D+BLPAb4LfA74E/AMp8IivgAAqBOcA8oBKoBRqAtcBNQBewB+gH0sCdwEHgq8AR4OvA
+# E8DfAieBF4GzwHngfeCfgI+AfwU+ASwLiLxAERACqoE1QCuwBegAbgYMYAS4C3gEOAG8APw98I/Az4HfAJ8A6kKMBfADxUApUAHU
+# AKuBCLALiAG3AsPAHcBB4KvAg8DDwDeBvwGeBk4BLwOvAeeBnwIXgH8BtEVETmA2UAtsAXYAuwAD2Ad8CTgE3Ac8BJwAngcmgDPA
+# eeAnwEXgF8CvgMvAb4H/AByVRLOAcmAx0A7sAvqADHAAuB94AngaOAV8H3gVeB04D0wCF4FfAP8M/BvwfwFlMVEO4AWeAazYuw4A
+# 25e8QAEwFygBSoEgUAZgWxG2D2GLELYBwdQJZkwwKcLSEpaCMD2E7hOaIVQt/ATcCMG9UA1QCywF6oBlwHLpW1YAK4EGoBFYBawm
+# 0980Ac3AWqAFWAesBzYAG4GbgDZgO9ADxIA+oJ/7JsAu/dkHGEguKAM+CprjVWSeS/KXg+YcqFKeJ/nfQe6TPK/HP62DiQlI3g4+
+# X/KBGfycMnNONVlnIWCZwVslXyz7WgH9OaAePneS5+3VS56311Rmls2fUU+h5IskeD+5bPYMnXkz+PAM/bDUnyP5jbL+BVJn1jRf
+# ZuovlPqzJb9N9o3zn5f8YskXShsguUY1ko9Ins9th+T3QD8q+QT4HZLnbXVOl4X8c5Lnc/55yWfAd0n+bvC7JP8g+J2S/xb43ZLn
+# ff6C5J+awZ8Er0v+e+D3SP6HM3Q+mMF/NIO/PIOfDF7luT3cPD3eGTpa6CrvnMHz+f+z6bKQd0s+GDJtvFbOYa/kuf40/zbateFj
+# EfvaQZvF3nbSNrG/vcjhtuyjHGFLAWoXdqTQmNj3JfQ/xN63i7O9BBa8T9BldJtMf0mm/1ymD0h6VNCl9JigdfQNSZ8QdDl9U1CF
+# jgmq0XFZz5OSPiX1/1bW97Sk35X0OUHz6CVBa2lC0CV0Vua/KeVvyfQ/yvp+Jtu7JNO/kPRXwr8tILegKg1L+kVJ7xRUo0OS3ieo
+# Qq9K+rqgtXRO0Cr6SOxlH/2F2MduGgXNgZz7gFx4TVX4mcWSzqOvCLqS7ha0mu4RtIx+JKhG5wUtp38AdWMdPYLaaa+gVkoJupBu
+# l+m/lPTvhd+aJ9rJQ/9MqpAh6UGZ/18E9dB7gnrpJ4LW0E8FDdF/FTSPJoW/8NNDgi6lcUnPCN9RKeovQr+fl/QFQRvo+4LOox8I
+# 37aMbhU0QPcLqtEDgjrpa4Lm0LcEraMfcp+J00UV9lgvaRn9WKyb2V4J8tOChigjaBndIegi+rJM3ytoPj0sqIsekXbwqMz/tqCN
+# 9FeS/rWUPy/pC9K+XhT0RvqeoOa4SuS4SnBKvSxomF6R8nel3n+T9VwQdD5dlOl/kvSXwm7KxLnDqSrochFv8/Rd0j7fEbSYfi78
+# dykdEbSAvi7OYEZfFVSl7whqk1Slv5Npk1roDeHbzXbCKP+g9On7BdXohKCz6QPhx029hViJhKBzJS2RtJj+uzjrc+mkOO9XCP1K
+# WMZh4ftnSdpAb4s4wKyvCif7LTI9ImiR0KtClPE3Mv2aoBq9L86NRnpc0EJ6VsQRZj1LMGunBLXSaRmvkDy7uP/bwu8tOHSGqkx5
+# iYxtiqRf5vl3I39M5pfKs376TOT5jyLfCqys5rGBIuKG+lLzvN7FbDTojYodx3N43iqZF/XayPBWiTxVlET8UmrGS4NBvvIhJY98
+# wcEg3427fLORXoLaEiI1l3w15aE6cND53zt9QcpXRl/Z6fOTTzGCzShtBJvQnhsrqoq6t6Bu7qNXqcPUqKkUHjK8tchxohckfH8E
+# /cpng83nvAH22/DuNefYkLcDdTjYzjIXBdj83Q9cI8uhaJmdVjAL2lqMmiJBF51Wfd6T6lBwG9bCoe4sz6VIeQ6dXjqpaQqXNglp
+# CaTIqSihUy3ltUtpV7nnGgnGVV5IPjVa4aGydXUtRcS5aHAuRcpmoTUDq+SARWwlDTqF2L1f/GEb+ElVZeEPDe9a9MaNjw+Un28D
+# GPt7wt96SWF5VKx8jFF/DrnojTqLAmpt7enV5/x8bKqQuSmiuiiioY55p6InWyJaDkWsbjrVebI3Yp1Fp5ZdsGlKNwKxoWpG++xO
+# 6y6rnUJWrEYhX7F96OUs7J5uO5+dYnjxbrsKrgic73dGMB80ZM/DSvsQfYZycingeOzo0dXnvt3tYLBJlWY5jGABvFCIuSiaY4em
+# Bh84tinfQU1vnDC8AayWI9fw+jl1nv3xG995/fu+XPZyxDWL6i5upUmXkxnVn6fXXE73qcaxt8bWvPHM2U+MYCdORIcnYOubQox9
+# p4ukxBbwfBOSZf+uYQRhhb3IXqm7eR5mKQerXW9zUL5ldI3PkZ87+orR5aBnf3TE4tHGdpx9eIVHI9stYcV2r9FlpUu7Da8dJSY9
+# Huabx/vqyw1fZBd983yFMnUyyrgtw3pUO3VrGnVbNBpsUqgmagQLYbl8P5h75d5SM+aOBIO0h91ANajbXF3DWyfWmMcwpn3fX2rG
+# NT7a3TSHdmArrWAqNAzvUngJB1vBKsAvlzzsf05HUwBew0KFStPjQ9hbpKxEbV3rA6J2zEP+7vVzaEhEr06LEZyD+4QbtZeKdvm8
+# 8Hb/Eu3yMzM66kXfIwdK6H3GlEnG7Ke80QOQ5V1A+qTXz0ZXDwUjfO9Q9EAF1cM3RA4U0VLRy52jRXSBkb3cB9sfq6DyPNAD5Vym
+# lectA+/kvLU8bzl4xGWsjtXRBYVpF1Rmjd7lowfmbbdgN4CbtKps0qawB/Zvt2lWKVEgUa6RqNA3eYuqQW4RvKpaJhVFfSC0XcF+
+# YoyF33KL1eDr8Wwpibgw6eWe0PCuF96LruS/cCU/KPLXyXwez/F1fAn5v8ek2e18XnnkmpuDu8mUPXcu7NCCUyI66sFZ/rHCZ3MF
+# 1mA+/VLpGA1RgSJuhwqXdd0TIi57HGvwZfil8K3GlhNOYpFReD8X7hOuBmixt8NOLnkSni3Azr/11qqh4HYx+zvv88OabqQepZJ8
+# 7nqlRKSiY3k0FHRjDaMH8kRqnaK496iL6NyZszX56nMtb9a0KczNc4e8ucIHDnm9nHqGvB5ObUNeF6fWPd6FJNY+n13yBeq296M+
+# L61TFRY9XEbrXC72lMvlPec6+24bl/E8RWH3hIaCWxBZ5Sr3hqIH86GvsrryKhK8S2UnN7fhOZ2zUi2lyGFEqO/OBs2lU+9GDztE
+# 3SfBFVKb06VGD8Nr3gWveb/pNX9JDu3wuq2aS/UFfO7wP0y3HD1YIOocq329JnKwhMZqK2EDqxQrP02qW6iI2zPzuVDmaGQ0V1j5
+# Ke8Y5jXpO9hwznuIfAHu3bG3hGXOxnjnot/w3rW83RpyKDwVPXy1L/+LHK7DP9vqUkXd4Q8jo/C3B9zEd8uDLr6aOVfTMEEf9kgx
+# zoS6jg5YCeZAIXWlUk+RUcyBslRYTuQA5qEsehfmQdPUk80bYZbRUZ4i1Y8bw1CTky73OwL+fGw1xCwKzIqtVQrhQdQC8vuwozXc
+# cYospFgCpMyyEvspu539KmPnbxjCDqHp00wNnnv7pFrI2IuKhpPGUkQKTgZuy+HvXqvlsynWIqrr/z16WcbfTNhwi4F3wKwzZhvL
+# y1dozVBwKz+P6ESAkehzPtnEOKE9rfms12fh82yBHl8DzNxUdIzPhWLDrp3i/qUMa8zUZS3PEV+pU9WI3/KjBwp5eXqSOZkfAcxi
+# HIIrlXuoUmGBVQrORD6uYvTYjx7PtmJebOj9LOy+gzyuWHOCscDrvgALfHfDmnNl58oC/u9u0FcfZ8wf8D92dOeaygLFv6rAQU/6
+# FX+g4Pxb9615yu8vCKsKGssv0FueUpSC/ILLzcdBD4XG/s+5fN5ivnpnC/TU4xaLn+/NDnJYDu0YO33Of1xV/bw/+dqdLTxnKc7k
+# Q7WKNkvM51jruYLjVisW0czVsRMP5UW/4qGNViv5/STWOeJ3WPgaM11RsKZqIUaEEWp+oaHMnoW15eO8srquPzYLfI0Vi58UWwHa
+# xyprxVjp2ZidLVOf1uWzO2krYEoRz7dOiTwuR5vvezw5b09dovdtua639/+a3rcW5bzddwl3pqlpy8xVnGjHM5vqPllgWrlKTrHT
+# uZWrs69a+ZLomIOvu/Nk2RUrRzDn08SYn4fdynFNOp1Mme2h8E8i2D+rELt3OxGrgb/gInv0/grUWQ5v5cSe9VHkIOQFqjV6cDb5
+# PHw0vOd+OGlu13ZEinbsEntAITtmK+OywWfrqLNAYfRScACcjnFL3668fITL5otYzCIiUaKKoPmOy6iuJK/iFpEvP0cXBeXZESxD
+# lHb1bJnOr7mSH7omv0i+uatH/hNXYjyslFKIGK4YMRzO2BZ+xvLUBVW1R7B+FzRNi1hcdMRi8fG47tnY2I6INYeOwK4iNqT3jfWN
+# FR63W2xj8487rDlHGMsbyzuiKIGx0NnCs/OjuRXUZslVOZ10qqzNmusUPPxZmz3XJXi3qkLujlrB56pam92aK3i7amlzWO2C96jW
+# NovVE7VU8DPZ1uawWKOWcmpjFjWqgiqqU1Cb6pJpd1ThaSVX0BzFLihTPFHG04gGmJPa8pnG6aSiMfCK5JUrPPwj14mwYu5F2E5Q
+# Nz81xRp1Bs13s3twG9lZHaRIda64ubkhCVM5Io9dS7ySloEiPlnikLRA0nxxEuSQz8dPEL/p5X9neJeIeq7GbT1oi98Vo02Ii5px
+# PqzNFecD/BhrY2SJNpUJueHdK85c+KPmc2X5yqtNZ8vM/AJZDpGXoii+Fu4hy3HiTNeClq2mppfq4YejrWZtiJutkeYSiq4t4DvJ
+# crJsLO9cQbRZ+FrLWN7rBeE8rst1ZEzHeJ0FKHd736TVOjXW12ZFva35xOuGp7bcQ/wM92JX3EttZLWYsSwfZzpo3h0RnwZLaUfZ
+# HESAudPRJerl7y52I8Z0i/e+ZpmRoPm+2/AuM8/WvHph+yKixYo4piNaxExYO29Y8YEroR1rEf0qxbQbUTCPnLrWBnBHwv2wyU87
+# EB2vQE92N1+JbYnHtk0Utq5Ayzxq08R+Nd9L3xU036Hzt4uLkdsvSvhYystv6A6lHvss5eVvbZxKKSIqw7uH3yrBl1C98i9TO0Kl
+# oB9Pmad8iBbiDsvfs+rKAviAXRRUnbiPYYzB3bjdO0lX5wt5tea8IjOCXRg3v6l+QbSeJ9/D85jzvqD5XUOAmqdoqp9uxAzfAuvN
+# Z99q7meLQEfX9LOF5GfbqJ+FqR82HaIq9IK/IY1jTAXiG4AFZHqq6Vj2qPRT0/d3viYII+gbQfN7gxWaKm6YsAnvPL4GSl0ZbhvB
+# CvTEqQRDfPRcQ4w7y9dwB7SczKfU4wa6QvFQsToE/XbEtU4l/FuXang3ow0nC1+ux9r58oxgN+o3gjqt5TWWF1E97qWlShFkN2LM
+# DmUlIrSTPhYMKy50OcRK0MoNvBVlMLhIvEGYQ77fDFbPpxrVaCqnQLBbW4zRV+I2eTO3pGCvWOsi8b0DE9/fWDHG+eJdPrfBDXfe
+# GN4g7IDP9+mg+Z3MTEuQdsDq2bxpO2ClzLQDJnjMBPwxtyuGZw2XYn6KMT+5V9KlGLERDGO84Umz9pj079hgou1Xg+Z3OPy+8ALr
+# R8R+C6ytH/F5v8ZX90HGo5/t6Ikvwj2ADxxfb35v5GvQD9rNeM1x4Ud47LQSHrNbgSzYB/3r7XeFYpf5A7xnOSF1LmZuAbyLEVyN
+# qJbXEf65mxYy8YrVTTEwSrrh0Ije2E4JdNvddayRBTwjrAD3YQ+b42lU9s+lEaidOfbOO3GW52F+z8jleLyL5XsaG4+dWZ5WcvdP
+# wUrd9CYiNndj1ztTjSOz6EHwqOSRSjwa21ihh+XnNtEPeMMv8ce7XDk+cuzYMTRXWdk1cvmWM5Wr2i4di4+0sVI0O8Ly3Uruzin0
+# YWoVamh2vn4m/k7bpUuNXXFW5Ok6hr48cvmdy1Asc7+ifPEDJf8PkMdR2vlnbJEH2cord86luPiCyk3jvEF6WTwfZzb5Rsz9ziF0
+# kANlp6ZA43QCKm1dlejXsUY6xfisnJnCcFHpJXqdl3/VHFz82KUu2kruEhby0FzMXWNbW1ulsmA/cbdYzWcDlZS2lbS9W9nW9q+V
+# jzxyjF/JMbFxlC7pohvML8zcz72Dqj5ZI/bxfOknCiRVJWXSpqff2SkSKj6apKrw3ub7QCa/j1Rlnk3KPJL6JQ1IGpZUk3SB5JUr
+# HxLxvm1GW+Znuh+10gfXCu2r8jpRn0XWa5/+XlF8W2N+X+kUWiaWActFvXlC3yXLeSWd/u6yCM9ZUlYsaYns8wLRA7N8LbEgqeH5
+# nWRv7EnEjXhmNVkbTaqtbljdQDnNkQ1rb67HH7EWsras3xJdHyGlZRNZWtqbN28jto6UdfAGraS2traSdUP7zm0bEf1v7OiMJluS
+# iWSK2CZSNrUCm0jdhIdlE/9Dup3YTcTaSWlHTjtEGh48eRPQTrPadaM3lYz3VvUkjUzMyFS1cDqSaaDS67JSsXRVJJZODqd6YukG
+# Cl5R6E/pgwPxnnTV2nhmrz5YgTr64v0NM2r/lMbM2j+V1TGg98ZSDXTDZygkhlOb9fStrfFEJpaq4MkGKvv/6TVQxfUqLbqxT09X
+# dMZSGOzmZG/sMztrajVQ0Wdk8WlvoLnX58xsueT67G163MhUNCfi/cZnVizyGyh0fY45MxXReCL2R3s8PXuzr8+K3jYY69N7YjM7
+# PZyJJ6rWxdODCf22zbFMCnoNtOBK9r54bH9Vy0AyFUuKatB6a0rfG2vRE4luvefWBprzJ3QbyH9tbiceDTTveuGGVHJ4EKt0W3I4
+# s01HC9fM+bVqM4d9JQeFYnzW5l/J2h/v7Y9lqkR3zYo/VX+4vSe5t6ovDqPO6LCCVFVvvD+e0RMpLEBVBI8WjKViSQNV/ec0OWOO
+# 8Ib/VAG+xr16Yl/81irdMJIZPRNPGlXrjZ5EMh03+lsSehrdLP9TOliygWQvN7PrlTYZRiwlKyn7jPzNsb3dUoFv5rmfodIBG9Uz
+# w7yree236Pv0qoRu9FfJSr0zRJv1zAB3CFclW5Idwz0DrfFYonf9SE9skFfYQL4ZGlu7b4n1YM0CM2SRYcPQuxOxazU7YJiGcCef
+# lq0djieEvV+jfls6E9vLh3RVlor1VX0upt8aifXFYCrmLvgT2Y3XNIbsBPpaJYbTQPlmltg8zamUflt7PJ35I+LG6fEJ8SYYg55J
+# Xu2wkEZgtEl0OGfz1i1bO7Y1t6wn65atkc3N7eSatpbFXJ3s00ZGOdHIpuYtG9rXdxDrJKWzlSydrfx0UDtb4d474e07+TnQKc4B
+# uyCcg7SdP7rIikdrK86IThwFne1QbW9FUa2zHRou/pSfTULYzmvtItZFShfYXWsBHDi7UMGuDsrVe3AmpFsTen+aVL23l2x4iJ5a
+# 9cHBmIHAWU/1dyOV7sFWJYuegRkhmcnoPQPk5u6kH/vbMAtp3YnhGFm6+fqSQ5BmUcDR09cPr52GOZGCgtaeAT3VjPp6EjE9RWpP
+# MgFenIkOQaJJHJOkgU+LjPRScvWI86llAGsb6+XSYfTI2ZOK6ZmYeQqh7v1k640Z6XjmNs6Yvc7pjfHuNicSkCWFc4Espe83T2Er
+# Z7ekyc5pFKcoOTnHT5k4podcqA/bae1wH8wM3elLJHmpPl4Ppg0Oixx4tAyI4ZJrmm8RHbTzJN97ppJ5TpMX/LpYTwIesFfYJ+Vx
+# yTU+nXIh2mTAG8G0KQcJ02GSE+yVE1201zE8GEv1iFb8SH4uDtPc3xlPx7vjCTEV/Ykk3C1mrT9x2+AASCoWM8g2oKe38O5YBmJ6
+# 705SB9L7SI33jpATNcRGtvaJgZAjjhM1Ee/FRJMvnm4Wqx/rjSbNhsgWT3cMJPcbZI/LrUIaOoPB8+c6TCbZOBeBrppAw1Y8+jMD
+# SMQzpO7VR8iOx/ZhvRcTujcOBWOD6Khm8MWyG7qRjMbBaQbvbg5/tiaSeoZsnN2ESVGMIfIljev6Fkga62KmrDWV3CulVkh5t1xJ
+# oyP+xdi0URUkjauz1tyPWerHmHtpVtL49JxescNBfvSTNpjEePP485rDlqxcBD1tCKOjHH6YdAzGIFCx9GRNxfYm98XIb9JrizpM
+# odhaNn4swaOgGHalPZXMmLVYU9zvY9OJXUhaKrkfU5gaxuLiYcDbkpbW0YIl3aMnYpSbxsJPb0VXOpZpFi4gDvdN9jQ3UL4lcgTH
+# txvNAbtp72AyBTPMtCZT0/qmYfEaroZOopwZzJATLN9MImbizYoUn2wzIeMacqe5vSYSW5KmofByw4M4KGI48NF3XsCSHtRhXSB8
+# yBbsiAzPyiQH0eJwd1qcKqRkqknD7sJOziTNk4asw4PCai2w34p9gnAPtQ97GzuZRyJp3OvuuGNd/e0hPudweaGVIZh+aFEI4cBg
+# PCEO1cq9CN1ERvdwP7KwbyphUT23pof3pkMr+/REOrYoBMOt1AfjoZU1yxaF0gN65RIU0bt1vXvpshXddbHu3qW9vTXd3SuWdOvV
+# sd5lfUvrapYv79P12NIeHbXuM5cFheoXL1tcU9kb2xf6c6rPjh/Pjj+bHT+dHX8uO/58dvyF7PiL2fHvZ8d/kB1/KTv+cnZ8PDs+
+# kR1/JTsxmp0Yy04czE58OTvxlezEoezE3dmJe7MTX81O3J+deCA78WB24mvZiSPZib/ITjyUnXg4O/H17MSj2YnHq5fU1C6tW16/
+# omvl4tCqBQsrG1e/dvxLZ54kpYJ9yOawQqaUgSm+SQkpuB0/w0qUINJFpSJd9Awr3GpqaoWbClsLlxVqSrkoWFRCjDHbg8EFo6Pa
+# q8UL2cVimsvE9+ef+njZZ8s+JV+Een5XXEnvzWb09lxGd5cx9lwZo6dDNu3RCqZ9D5gELlYz9m/VTHtoiULPLVFpdCmjfwbeW4Yy
+# yx1kpXlFbKP45OBjckWtd49qT69gB0a1u1aynMeBRxtZzkOrWM599azwY3lnrKoy76n1oGskvxF0a5WZv1PSAdCN8gefTL494Hfk
+# Jsii0z8ElX8D1Vd1SP5mdE+1eXedWZ7T6f9FUGb8P4JKV/8nQaOr/5fA79DT/5tgpav/n4AbrrgL8/9RUCXPf9PDvOZvm/lvh5Sg
+# 2Rb/HwZNfjfBx85/CM3r4b8psgTNPvHfBqlesz0+PqvU4b894hdxJv+P4v8B2RdBpg==
+# __DEX_END__

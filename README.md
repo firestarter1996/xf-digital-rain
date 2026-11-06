@@ -1,6 +1,6 @@
 # 🟩🌧️💊 Digital Rain
 
-A plugin for Nagram XF. Movie style digital rain as the background of every chat.
+A plugin for Nagram XF. Movie style digital rain as the background of every chat and of the main screen header.
 
 ## What you get
 
@@ -8,15 +8,17 @@ A plugin for Nagram XF. Movie style digital rain as the background of every chat
 * Columns falling at different speeds, each led by a bright white glyph with a soft glow.
 * Trails that fade from bright to dark, with glyphs flickering inside them.
 * A black background behind your bubbles.
+* The same rain behind the main screen header, a little dimmer so the title and icons stay easy to read.
 
 ## Settings
 
 * Digital Rain on or off.
 * Color hex, film green `#00FF41` by default.
-* Color slider that sweeps the hue and writes the hex for you.
+* Color slider that sweeps the hue and writes the hex for you, with a live swatch and the hex shown in the chosen color.
 * Rotate through colors, and the color rotation speed.
 * Rain speed, from 0.2x to 3x.
 * Particle count, from 10 to 300 falling streams.
+* Reset to default puts every setting back at once.
 
 ## Performance
 
@@ -26,7 +28,7 @@ On a Pixel 6 Pro in a busy forum topic, scrolling stayed the same with it on and
 
 ## How it differs from Custom Snow's Matrix mode
 
-Custom Snow scatters single green characters as particles over the wallpaper. Digital Rain replaces the wallpaper with real falling columns, leading glyphs and fading trails.
+Custom Snow scatters single green characters as particles over the header. Digital Rain draws real falling columns, leading glyphs and fading trails behind your chats and the header, so it replaces Custom Snow. Where the rain is on, holiday snow is not drawn over it.
 
 ## Install
 

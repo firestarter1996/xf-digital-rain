@@ -1,8 +1,8 @@
 __id__ = "digital_rain"
 __name__ = "Digital Rain"
-__description__ = "Movie style digital rain as the chat background: mirrored katakana, digits and symbols falling in columns at different speeds, a bright white leading glyph with a soft glow, trails that fade to dark, and glyphs that flicker inside the trails. Pick any color by hex or slider, rotate through colors, and set the rain speed, color rotation speed and particle count. Made by [firestarter1996](https://github.com/firestarter1996)."
+__description__ = "Movie style digital rain behind every chat and the main header: mirrored katakana, digits and symbols falling in columns at different speeds, a bright white leading glyph with a soft glow, trails that fade to dark, and glyphs that flicker inside the trails. Pick any color by hex or slider, rotate through colors, and set the rain speed, color rotation speed and particle count. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __min_version__ = "12.5.1"
 
 # Performance first: all drawing lives in a small embedded Java view (no Python per frame).
@@ -54,6 +54,7 @@ class DigitalRainPlugin(BasePlugin):
         self.core = None
         self.rows = {}
         self.refs = []
+        self.headers = set()
         try:
             self._load_core()
             self._sync()
@@ -69,6 +70,53 @@ class DigitalRainPlugin(BasePlugin):
                 plugin._attach(param.thisObject)
 
         self.hook_method(ca_cls.getDeclaredMethod("createView", ctx_cls), CreateViewHook())
+
+        # 1.1.0: the main screen header gets the rain too, behind its title and icons
+        da_cls = find_class("org.telegram.ui.DialogsActivity")
+
+        class DialogsHook(MethodHook):
+            def after_hooked_method(self, param):
+                plugin._attach_header(param.thisObject)
+
+        try:
+            self.hook_method(da_cls.getDeclaredMethod("createView", ctx_cls), DialogsHook())
+        except Exception as e:
+            _log("hook: %s" % e)
+        # the chat list lives inside the main tabs screen and is built before plugins load,
+        # so the tabs screen's resume attaches it too
+        class TabsHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._attach_header(param.thisObject.getDialogsActivity())
+                except Exception as e:
+                    _log("tabs: %s" % e)
+
+        try:
+            tabs_cls = find_class("org.telegram.ui.MainTabsActivity")
+            self.hook_method(tabs_cls.getDeclaredMethod("onResume"), TabsHook())
+        except Exception as e:
+            _log("hook: %s" % e)
+        self.headers = set()
+
+        # Holiday snow (Custom Snow forces it on) draws over every header child; where the rain is,
+        # the rain wins. Skipping it also ends snow's own redraw every frame in that header.
+        snow_cls = find_class("org.telegram.ui.Components.SnowflakesEffect")
+        view_cls = find_class("android.view.View")
+        canvas_cls = find_class("android.graphics.Canvas")
+
+        class SnowHook(MethodHook):
+            def before_hooked_method(self, param):
+                try:
+                    if plugin.headers and int(param.args[0].hashCode()) in plugin.headers:
+                        param.setResult(None)
+                except Exception:
+                    pass
+
+        try:
+            self.hook_method(snow_cls.getDeclaredMethod("onDraw", view_cls, canvas_cls), SnowHook())
+        except Exception as e:
+            _log("hook: %s" % e)
+        self._attach_all_headers()
         # a chat already open when the plugin loads gets the rain right away
         try:
             f = get_last_fragment()
@@ -114,6 +162,50 @@ class DigitalRainPlugin(BasePlugin):
         except Exception as e:
             _log("attach: %s" % e)
 
+    def _attach_header(self, dialogs):
+        if not bool(self.get_setting("enabled", True)) or self.core is None:
+            return
+        try:
+            if dialogs is None:
+                return
+            bar = dialogs.getActionBar()
+            if bar is not None and int(bar.hashCode()) not in self.headers:
+                self._call("attachHeader", bar)
+                self.headers.add(int(bar.hashCode()))
+                _log("header %s %dx%d" % (bar.getClass().getSimpleName(), bar.getWidth(), bar.getHeight()))
+        except Exception as e:
+            _log("header: %s" % e)
+
+    def _attach_all_headers(self):
+        try:
+            f = get_last_fragment()
+            stack = f.getParentLayout().getFragmentStack() if f is not None else None
+            da_cls = find_class("org.telegram.ui.DialogsActivity")
+            if stack is not None:
+                for i in range(stack.size()):
+                    fr = stack.get(i)
+                    if da_cls.isInstance(fr):
+                        self._attach_header(fr)
+                    elif str(fr.getClass().getSimpleName()) == "MainTabsActivity":
+                        self._attach_header(fr.getDialogsActivity())
+        except Exception as e:
+            _log("headers: %s" % e)
+
+    def _reset(self, *_):
+        for k, v in (("color", DEFAULT_HEX), ("rotate", False), ("rot_speed", "20"),
+                     ("rain_speed", "1.0"), ("count", "80"), ("enabled", True)):
+            self.set_setting(k, v)
+        self._sync()
+        for key, row in list(self.rows.items()):
+            try:
+                row[1]()
+            except Exception:
+                pass
+        try:
+            self.reload_settings()
+        except Exception as e:
+            _log("reset reload: %s" % e)
+
     def _color(self):
         c = _parse_hex(self.get_setting("color", DEFAULT_HEX))
         return 0x00FF41 if c is None else c
@@ -144,6 +236,7 @@ class DigitalRainPlugin(BasePlugin):
         if self.core is None:
             return
         if value:
+            self._attach_all_headers()
             try:
                 f = get_last_fragment()
                 if f is not None and find_class("org.telegram.ui.ChatActivity").isInstance(f):
@@ -152,6 +245,7 @@ class DigitalRainPlugin(BasePlugin):
                 pass
         else:
             self._call("detachAll")
+            self.headers = set()
 
     def _on_hex(self, value):
         c = _parse_hex(value)
@@ -164,7 +258,7 @@ class DigitalRainPlugin(BasePlugin):
 
     # ---- settings ------------------------------------------------------------------
 
-    def _slider(self, ctx, key, title, default, lo, hi, fmt, on_value=None, get_value=None):
+    def _slider(self, ctx, key, title, default, lo, hi, fmt, on_value=None, get_value=None, swatch=False):
         LinearLayout = jclass("android.widget.LinearLayout")
         TextView = jclass("android.widget.TextView")
         Gravity = jclass("android.view.Gravity")
@@ -191,6 +285,23 @@ class DigitalRainPlugin(BasePlugin):
         v.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText))
         v.setTypeface(AU.bold())
         v.setText(fmt(get()))
+        sw = None
+        if swatch:
+            # live preview of the chosen color: a round swatch, and the hex in that color
+            GD = jclass("android.graphics.drawable.GradientDrawable")
+            sw = GD()
+            sw.setShape(GD.OVAL)
+            sw.setStroke(AU.dp(1), _jint(0x55FFFFFF))
+            dot = jclass("android.view.View")(ctx)
+            dot.setBackground(sw)
+            row.addView(dot, LayoutHelper.createLinear(22, 22, 0, 0, 10, 0))
+
+        def paint_swatch():
+            if sw is not None:
+                c = _jint(0xFF000000 | plugin._color())
+                sw.setColor(c)
+                v.setTextColor(c)
+
         row.addView(v, LayoutHelper.createLinear(-2, -2))
         root.addView(row, LayoutHelper.createLinear(-1, -2))
         bar = SeekBarView(ctx)
@@ -206,6 +317,7 @@ class DigitalRainPlugin(BasePlugin):
                 else:
                     plugin.set_setting(key, ("%.1f" % val) if hi - lo < 20 else str(int(round(val))))
                 v.setText(fmt(val))
+                paint_swatch()
                 plugin._sync()
 
             def onSeekBarPressed(this, pressed):
@@ -227,6 +339,7 @@ class DigitalRainPlugin(BasePlugin):
         def refresh():
             cur = get()
             v.setText(fmt(cur))
+            paint_swatch()
             bar.setProgress(float((cur - lo) / (hi - lo)))
 
         refresh()
@@ -247,7 +360,7 @@ class DigitalRainPlugin(BasePlugin):
     def create_settings(self):
         items = [
             Switch(key="enabled", text="Digital Rain", default=True, on_change=self._on_enabled,
-                   subtext="Movie style rain behind every chat"),
+                   subtext="Movie style rain behind every chat and the main header"),
             Header(text="Color"),
             Input(key="color", text="Color hex", default=DEFAULT_HEX, on_change=self._on_hex,
                   subtext="Film green is #00FF41"),
@@ -269,7 +382,7 @@ class DigitalRainPlugin(BasePlugin):
                 items.append(custom("hue", self._slider(
                     ctx, "hue", "Color slider", 135, 0.0, 360.0,
                     lambda h: str(self.get_setting("color", DEFAULT_HEX)).upper(),
-                    on_value=self._set_hue, get_value=self._hue)))
+                    on_value=self._set_hue, get_value=self._hue, swatch=True)))
             except Exception as e:
                 _log("hue row: %s" % e)
         items.append(Switch(key="rotate", text="Rotate through colors", default=False, on_change=self._sync))
@@ -284,108 +397,117 @@ class DigitalRainPlugin(BasePlugin):
                                                           lambda x: "%d streams" % int(round(x)))))
             except Exception as e:
                 _log("rows: %s" % e)
+        items.append(Divider())
+        items.append(Text(text="Reset to default", icon="msg_reset", accent=True, on_click=self._reset))
         items.append(Divider(text="Draws only while a chat is on screen, at most 24 times a second, and stops when the screen is off."))
         return items
 
 
 # Compiled RainCore (java/ in the repo), zlib + base64
 # __DEX_BEGIN__
-# eNqNew18lNWZ73Pe952PTOYrM5MPAiSTSdDhIyQkBAIJkBAIYMLXZEhLoCtvkkkyOryTzEwg1q6GYItaUcuqFdfadndB2boVwY+2
-# muhKi2hl16u2NxdpV3p7rdfu3WFv93b763Wb+z/nPYEgtnczv//7POc5z/l+znOe886kNzbiqK6tpw9XZVqO+k+/+cTRL3z444mX
-# 1r2ZisSSv366ZHQJ0SARjXQu9ZH8O1lN9Gsy5fXAHI1oDegnoFWgl21ESdCBHCIV9AMnUVMF4CK6IUQ0H1gM1ANNQCuwHYgCu4E9
-# QD9wC2AAQ8A+4A7gXuAw8DXgYeAx4NvAMeAp4DvAM8BzwA+ACeA14GfAH4BgOVEDsBu4C3gSOA98BCjoYxnQDOwC7gQeA14Efgoo
-# 81AeqAN2A/uArwEvAx8ChTdgHoAe4G7gKeDHwMfAfwCeG4mWAOuBXUASuBd4AhgHLgL/DrjDRPOABmAr0AV0A0PA7cBXgHuAw8BD
-# wFHgG8BfASeA08D3gHHgR8AbwHngPeAC8D+BLPAb4LfA74E/AMp8IivgAAqBOcA8oBKoBRqAtcBNQBewB+gH0sCdwEHgq8AR4OvA
-# E8DfAieBF4GzwHngfeCfgI+AfwU+ASwLiLxAERACqoE1QCuwBegAbgYMYAS4C3gEOAG8APw98I/Az4HfAJ8A6kKMBfADxUApUAHU
-# AKuBCLALiAG3AsPAHcBB4KvAg8DDwDeBvwGeBk4BLwOvAeeBnwIXgH8BtEVETmA2UAtsAXYAuwAD2Ad8CTgE3Ac8BJwAngcmgDPA
-# eeAnwEXgF8CvgMvAb4H/AByVRLOAcmAx0A7sAvqADHAAuB94AngaOAV8H3gVeB04D0wCF4FfAP8M/BvwfwFlMVEO4AWeAazYuw4A
-# 25e8QAEwFygBSoEgUAZgWxG2D2GLELYBwdQJZkwwKcLSEpaCMD2E7hOaIVQt/ATcCMG9UA1QCywF6oBlwHLpW1YAK4EGoBFYBawm
-# 0980Ac3AWqAFWAesBzYAG4GbgDZgO9ADxIA+oJ/7JsAu/dkHGEguKAM+CprjVWSeS/KXg+YcqFKeJ/nfQe6TPK/HP62DiQlI3g4+
-# X/KBGfycMnNONVlnIWCZwVslXyz7WgH9OaAePneS5+3VS56311Rmls2fUU+h5IskeD+5bPYMnXkz+PAM/bDUnyP5jbL+BVJn1jRf
-# ZuovlPqzJb9N9o3zn5f8YskXShsguUY1ko9Ins9th+T3QD8q+QT4HZLnbXVOl4X8c5Lnc/55yWfAd0n+bvC7JP8g+J2S/xb43ZLn
-# ff6C5J+awZ8Er0v+e+D3SP6HM3Q+mMF/NIO/PIOfDF7luT3cPD3eGTpa6CrvnMHz+f+z6bKQd0s+GDJtvFbOYa/kuf40/zbateFj
-# EfvaQZvF3nbSNrG/vcjhtuyjHGFLAWoXdqTQmNj3JfQ/xN63i7O9BBa8T9BldJtMf0mm/1ymD0h6VNCl9JigdfQNSZ8QdDl9U1CF
-# jgmq0XFZz5OSPiX1/1bW97Sk35X0OUHz6CVBa2lC0CV0Vua/KeVvyfQ/yvp+Jtu7JNO/kPRXwr8tILegKg1L+kVJ7xRUo0OS3ieo
-# Qq9K+rqgtXRO0Cr6SOxlH/2F2MduGgXNgZz7gFx4TVX4mcWSzqOvCLqS7ha0mu4RtIx+JKhG5wUtp38AdWMdPYLaaa+gVkoJupBu
-# l+m/lPTvhd+aJ9rJQ/9MqpAh6UGZ/18E9dB7gnrpJ4LW0E8FDdF/FTSPJoW/8NNDgi6lcUnPCN9RKeovQr+fl/QFQRvo+4LOox8I
-# 37aMbhU0QPcLqtEDgjrpa4Lm0LcEraMfcp+J00UV9lgvaRn9WKyb2V4J8tOChigjaBndIegi+rJM3ytoPj0sqIsekXbwqMz/tqCN
-# 9FeS/rWUPy/pC9K+XhT0RvqeoOa4SuS4SnBKvSxomF6R8nel3n+T9VwQdD5dlOl/kvSXwm7KxLnDqSrochFv8/Rd0j7fEbSYfi78
-# dykdEbSAvi7OYEZfFVSl7whqk1Slv5Npk1roDeHbzXbCKP+g9On7BdXohKCz6QPhx029hViJhKBzJS2RtJj+uzjrc+mkOO9XCP1K
-# WMZh4ftnSdpAb4s4wKyvCif7LTI9ImiR0KtClPE3Mv2aoBq9L86NRnpc0EJ6VsQRZj1LMGunBLXSaRmvkDy7uP/bwu8tOHSGqkx5
-# iYxtiqRf5vl3I39M5pfKs376TOT5jyLfCqys5rGBIuKG+lLzvN7FbDTojYodx3N43iqZF/XayPBWiTxVlET8UmrGS4NBvvIhJY98
-# wcEg3427fLORXoLaEiI1l3w15aE6cND53zt9QcpXRl/Z6fOTTzGCzShtBJvQnhsrqoq6t6Bu7qNXqcPUqKkUHjK8tchxohckfH8E
-# /cpng83nvAH22/DuNefYkLcDdTjYzjIXBdj83Q9cI8uhaJmdVjAL2lqMmiJBF51Wfd6T6lBwG9bCoe4sz6VIeQ6dXjqpaQqXNglp
-# CaTIqSihUy3ltUtpV7nnGgnGVV5IPjVa4aGydXUtRcS5aHAuRcpmoTUDq+SARWwlDTqF2L1f/GEb+ElVZeEPDe9a9MaNjw+Un28D
-# GPt7wt96SWF5VKx8jFF/DrnojTqLAmpt7enV5/x8bKqQuSmiuiiioY55p6InWyJaDkWsbjrVebI3Yp1Fp5ZdsGlKNwKxoWpG++xO
-# 6y6rnUJWrEYhX7F96OUs7J5uO5+dYnjxbrsKrgic73dGMB80ZM/DSvsQfYZycingeOzo0dXnvt3tYLBJlWY5jGABvFCIuSiaY4em
-# Bh84tinfQU1vnDC8AayWI9fw+jl1nv3xG995/fu+XPZyxDWL6i5upUmXkxnVn6fXXE73qcaxt8bWvPHM2U+MYCdORIcnYOubQox9
-# p4ukxBbwfBOSZf+uYQRhhb3IXqm7eR5mKQerXW9zUL5ldI3PkZ87+orR5aBnf3TE4tHGdpx9eIVHI9stYcV2r9FlpUu7Da8dJSY9
-# Huabx/vqyw1fZBd983yFMnUyyrgtw3pUO3VrGnVbNBpsUqgmagQLYbl8P5h75d5SM+aOBIO0h91ANajbXF3DWyfWmMcwpn3fX2rG
-# NT7a3TSHdmArrWAqNAzvUngJB1vBKsAvlzzsf05HUwBew0KFStPjQ9hbpKxEbV3rA6J2zEP+7vVzaEhEr06LEZyD+4QbtZeKdvm8
-# 8Hb/Eu3yMzM66kXfIwdK6H3GlEnG7Ke80QOQ5V1A+qTXz0ZXDwUjfO9Q9EAF1cM3RA4U0VLRy52jRXSBkb3cB9sfq6DyPNAD5Vym
-# lectA+/kvLU8bzl4xGWsjtXRBYVpF1Rmjd7lowfmbbdgN4CbtKps0qawB/Zvt2lWKVEgUa6RqNA3eYuqQW4RvKpaJhVFfSC0XcF+
-# YoyF33KL1eDr8Wwpibgw6eWe0PCuF96LruS/cCU/KPLXyXwez/F1fAn5v8ek2e18XnnkmpuDu8mUPXcu7NCCUyI66sFZ/rHCZ3MF
-# 1mA+/VLpGA1RgSJuhwqXdd0TIi57HGvwZfil8K3GlhNOYpFReD8X7hOuBmixt8NOLnkSni3Azr/11qqh4HYx+zvv88OabqQepZJ8
-# 7nqlRKSiY3k0FHRjDaMH8kRqnaK496iL6NyZszX56nMtb9a0KczNc4e8ucIHDnm9nHqGvB5ObUNeF6fWPd6FJNY+n13yBeq296M+
-# L61TFRY9XEbrXC72lMvlPec6+24bl/E8RWH3hIaCWxBZ5Sr3hqIH86GvsrryKhK8S2UnN7fhOZ2zUi2lyGFEqO/OBs2lU+9GDztE
-# 3SfBFVKb06VGD8Nr3gWveb/pNX9JDu3wuq2aS/UFfO7wP0y3HD1YIOocq329JnKwhMZqK2EDqxQrP02qW6iI2zPzuVDmaGQ0V1j5
-# Ke8Y5jXpO9hwznuIfAHu3bG3hGXOxnjnot/w3rW83RpyKDwVPXy1L/+LHK7DP9vqUkXd4Q8jo/C3B9zEd8uDLr6aOVfTMEEf9kgx
-# zoS6jg5YCeZAIXWlUk+RUcyBslRYTuQA5qEsehfmQdPUk80bYZbRUZ4i1Y8bw1CTky73OwL+fGw1xCwKzIqtVQrhQdQC8vuwozXc
-# cYospFgCpMyyEvspu539KmPnbxjCDqHp00wNnnv7pFrI2IuKhpPGUkQKTgZuy+HvXqvlsynWIqrr/z16WcbfTNhwi4F3wKwzZhvL
-# y1dozVBwKz+P6ESAkehzPtnEOKE9rfms12fh82yBHl8DzNxUdIzPhWLDrp3i/qUMa8zUZS3PEV+pU9WI3/KjBwp5eXqSOZkfAcxi
-# HIIrlXuoUmGBVQrORD6uYvTYjx7PtmJebOj9LOy+gzyuWHOCscDrvgALfHfDmnNl58oC/u9u0FcfZ8wf8D92dOeaygLFv6rAQU/6
-# FX+g4Pxb9615yu8vCKsKGssv0FueUpSC/ILLzcdBD4XG/s+5fN5ivnpnC/TU4xaLn+/NDnJYDu0YO33Of1xV/bw/+dqdLTxnKc7k
-# Q7WKNkvM51jruYLjVisW0czVsRMP5UW/4qGNViv5/STWOeJ3WPgaM11RsKZqIUaEEWp+oaHMnoW15eO8srquPzYLfI0Vi58UWwHa
-# xyprxVjp2ZidLVOf1uWzO2krYEoRz7dOiTwuR5vvezw5b09dovdtua639/+a3rcW5bzddwl3pqlpy8xVnGjHM5vqPllgWrlKTrHT
-# uZWrs69a+ZLomIOvu/Nk2RUrRzDn08SYn4fdynFNOp1Mme2h8E8i2D+rELt3OxGrgb/gInv0/grUWQ5v5cSe9VHkIOQFqjV6cDb5
-# PHw0vOd+OGlu13ZEinbsEntAITtmK+OywWfrqLNAYfRScACcjnFL3668fITL5otYzCIiUaKKoPmOy6iuJK/iFpEvP0cXBeXZESxD
-# lHb1bJnOr7mSH7omv0i+uatH/hNXYjyslFKIGK4YMRzO2BZ+xvLUBVW1R7B+FzRNi1hcdMRi8fG47tnY2I6INYeOwK4iNqT3jfWN
-# FR63W2xj8487rDlHGMsbyzuiKIGx0NnCs/OjuRXUZslVOZ10qqzNmusUPPxZmz3XJXi3qkLujlrB56pam92aK3i7amlzWO2C96jW
-# NovVE7VU8DPZ1uawWKOWcmpjFjWqgiqqU1Cb6pJpd1ThaSVX0BzFLihTPFHG04gGmJPa8pnG6aSiMfCK5JUrPPwj14mwYu5F2E5Q
-# Nz81xRp1Bs13s3twG9lZHaRIda64ubkhCVM5Io9dS7ySloEiPlnikLRA0nxxEuSQz8dPEL/p5X9neJeIeq7GbT1oi98Vo02Ii5px
-# PqzNFecD/BhrY2SJNpUJueHdK85c+KPmc2X5yqtNZ8vM/AJZDpGXoii+Fu4hy3HiTNeClq2mppfq4YejrWZtiJutkeYSiq4t4DvJ
-# crJsLO9cQbRZ+FrLWN7rBeE8rst1ZEzHeJ0FKHd736TVOjXW12ZFva35xOuGp7bcQ/wM92JX3EttZLWYsSwfZzpo3h0RnwZLaUfZ
-# HESAudPRJerl7y52I8Z0i/e+ZpmRoPm+2/AuM8/WvHph+yKixYo4piNaxExYO29Y8YEroR1rEf0qxbQbUTCPnLrWBnBHwv2wyU87
-# EB2vQE92N1+JbYnHtk0Utq5Ayzxq08R+Nd9L3xU036Hzt4uLkdsvSvhYystv6A6lHvss5eVvbZxKKSIqw7uH3yrBl1C98i9TO0Kl
-# oB9Pmad8iBbiDsvfs+rKAviAXRRUnbiPYYzB3bjdO0lX5wt5tea8IjOCXRg3v6l+QbSeJ9/D85jzvqD5XUOAmqdoqp9uxAzfAuvN
-# Z99q7meLQEfX9LOF5GfbqJ+FqR82HaIq9IK/IY1jTAXiG4AFZHqq6Vj2qPRT0/d3viYII+gbQfN7gxWaKm6YsAnvPL4GSl0ZbhvB
-# CvTEqQRDfPRcQ4w7y9dwB7SczKfU4wa6QvFQsToE/XbEtU4l/FuXang3ow0nC1+ux9r58oxgN+o3gjqt5TWWF1E97qWlShFkN2LM
-# DmUlIrSTPhYMKy50OcRK0MoNvBVlMLhIvEGYQ77fDFbPpxrVaCqnQLBbW4zRV+I2eTO3pGCvWOsi8b0DE9/fWDHG+eJdPrfBDXfe
-# GN4g7IDP9+mg+Z3MTEuQdsDq2bxpO2ClzLQDJnjMBPwxtyuGZw2XYn6KMT+5V9KlGLERDGO84Umz9pj079hgou1Xg+Z3OPy+8ALr
-# R8R+C6ytH/F5v8ZX90HGo5/t6Ikvwj2ADxxfb35v5GvQD9rNeM1x4Ud47LQSHrNbgSzYB/3r7XeFYpf5A7xnOSF1LmZuAbyLEVyN
-# qJbXEf65mxYy8YrVTTEwSrrh0Ije2E4JdNvddayRBTwjrAD3YQ+b42lU9s+lEaidOfbOO3GW52F+z8jleLyL5XsaG4+dWZ5WcvdP
-# wUrd9CYiNndj1ztTjSOz6EHwqOSRSjwa21ihh+XnNtEPeMMv8ce7XDk+cuzYMTRXWdk1cvmWM5Wr2i4di4+0sVI0O8Ly3Uruzin0
-# YWoVamh2vn4m/k7bpUuNXXFW5Ok6hr48cvmdy1Asc7+ifPEDJf8PkMdR2vlnbJEH2cord86luPiCyk3jvEF6WTwfZzb5Rsz9ziF0
-# kANlp6ZA43QCKm1dlejXsUY6xfisnJnCcFHpJXqdl3/VHFz82KUu2kruEhby0FzMXWNbW1ulsmA/cbdYzWcDlZS2lbS9W9nW9q+V
-# jzxyjF/JMbFxlC7pohvML8zcz72Dqj5ZI/bxfOknCiRVJWXSpqff2SkSKj6apKrw3ub7QCa/j1Rlnk3KPJL6JQ1IGpZUk3SB5JUr
-# HxLxvm1GW+Znuh+10gfXCu2r8jpRn0XWa5/+XlF8W2N+X+kUWiaWActFvXlC3yXLeSWd/u6yCM9ZUlYsaYns8wLRA7N8LbEgqeH5
-# nWRv7EnEjXhmNVkbTaqtbljdQDnNkQ1rb67HH7EWsras3xJdHyGlZRNZWtqbN28jto6UdfAGraS2traSdUP7zm0bEf1v7OiMJluS
-# iWSK2CZSNrUCm0jdhIdlE/9Dup3YTcTaSWlHTjtEGh48eRPQTrPadaM3lYz3VvUkjUzMyFS1cDqSaaDS67JSsXRVJJZODqd6YukG
-# Cl5R6E/pgwPxnnTV2nhmrz5YgTr64v0NM2r/lMbM2j+V1TGg98ZSDXTDZygkhlOb9fStrfFEJpaq4MkGKvv/6TVQxfUqLbqxT09X
-# dMZSGOzmZG/sMztrajVQ0Wdk8WlvoLnX58xsueT67G163MhUNCfi/cZnVizyGyh0fY45MxXReCL2R3s8PXuzr8+K3jYY69N7YjM7
-# PZyJJ6rWxdODCf22zbFMCnoNtOBK9r54bH9Vy0AyFUuKatB6a0rfG2vRE4luvefWBprzJ3QbyH9tbiceDTTveuGGVHJ4EKt0W3I4
-# s01HC9fM+bVqM4d9JQeFYnzW5l/J2h/v7Y9lqkR3zYo/VX+4vSe5t6ovDqPO6LCCVFVvvD+e0RMpLEBVBI8WjKViSQNV/ec0OWOO
-# 8Ib/VAG+xr16Yl/81irdMJIZPRNPGlXrjZ5EMh03+lsSehrdLP9TOliygWQvN7PrlTYZRiwlKyn7jPzNsb3dUoFv5rmfodIBG9Uz
-# w7yree236Pv0qoRu9FfJSr0zRJv1zAB3CFclW5Idwz0DrfFYonf9SE9skFfYQL4ZGlu7b4n1YM0CM2SRYcPQuxOxazU7YJiGcCef
-# lq0djieEvV+jfls6E9vLh3RVlor1VX0upt8aifXFYCrmLvgT2Y3XNIbsBPpaJYbTQPlmltg8zamUflt7PJ35I+LG6fEJ8SYYg55J
-# Xu2wkEZgtEl0OGfz1i1bO7Y1t6wn65atkc3N7eSatpbFXJ3s00ZGOdHIpuYtG9rXdxDrJKWzlSydrfx0UDtb4d474e07+TnQKc4B
-# uyCcg7SdP7rIikdrK86IThwFne1QbW9FUa2zHRou/pSfTULYzmvtItZFShfYXWsBHDi7UMGuDsrVe3AmpFsTen+aVL23l2x4iJ5a
-# 9cHBmIHAWU/1dyOV7sFWJYuegRkhmcnoPQPk5u6kH/vbMAtp3YnhGFm6+fqSQ5BmUcDR09cPr52GOZGCgtaeAT3VjPp6EjE9RWpP
-# MgFenIkOQaJJHJOkgU+LjPRScvWI86llAGsb6+XSYfTI2ZOK6ZmYeQqh7v1k640Z6XjmNs6Yvc7pjfHuNicSkCWFc4Espe83T2Er
-# Z7ekyc5pFKcoOTnHT5k4podcqA/bae1wH8wM3elLJHmpPl4Ppg0Oixx4tAyI4ZJrmm8RHbTzJN97ppJ5TpMX/LpYTwIesFfYJ+Vx
-# yTU+nXIh2mTAG8G0KQcJ02GSE+yVE1201zE8GEv1iFb8SH4uDtPc3xlPx7vjCTEV/Ykk3C1mrT9x2+AASCoWM8g2oKe38O5YBmJ6
-# 705SB9L7SI33jpATNcRGtvaJgZAjjhM1Ee/FRJMvnm4Wqx/rjSbNhsgWT3cMJPcbZI/LrUIaOoPB8+c6TCbZOBeBrppAw1Y8+jMD
-# SMQzpO7VR8iOx/ZhvRcTujcOBWOD6Khm8MWyG7qRjMbBaQbvbg5/tiaSeoZsnN2ESVGMIfIljev6Fkga62KmrDWV3CulVkh5t1xJ
-# oyP+xdi0URUkjauz1tyPWerHmHtpVtL49JxescNBfvSTNpjEePP485rDlqxcBD1tCKOjHH6YdAzGIFCx9GRNxfYm98XIb9JrizpM
-# odhaNn4swaOgGHalPZXMmLVYU9zvY9OJXUhaKrkfU5gaxuLiYcDbkpbW0YIl3aMnYpSbxsJPb0VXOpZpFi4gDvdN9jQ3UL4lcgTH
-# txvNAbtp72AyBTPMtCZT0/qmYfEaroZOopwZzJATLN9MImbizYoUn2wzIeMacqe5vSYSW5KmofByw4M4KGI48NF3XsCSHtRhXSB8
-# yBbsiAzPyiQH0eJwd1qcKqRkqknD7sJOziTNk4asw4PCai2w34p9gnAPtQ97GzuZRyJp3OvuuGNd/e0hPudweaGVIZh+aFEI4cBg
-# PCEO1cq9CN1ERvdwP7KwbyphUT23pof3pkMr+/REOrYoBMOt1AfjoZU1yxaF0gN65RIU0bt1vXvpshXddbHu3qW9vTXd3SuWdOvV
-# sd5lfUvrapYv79P12NIeHbXuM5cFheoXL1tcU9kb2xf6c6rPjh/Pjj+bHT+dHX8uO/58dvyF7PiL2fHvZ8d/kB1/KTv+cnZ8PDs+
-# kR1/JTsxmp0Yy04czE58OTvxlezEoezE3dmJe7MTX81O3J+deCA78WB24mvZiSPZib/ITjyUnXg4O/H17MSj2YnHq5fU1C6tW16/
-# omvl4tCqBQsrG1e/dvxLZ54kpYJ9yOawQqaUgSm+SQkpuB0/w0qUINJFpSJd9Awr3GpqaoWbClsLlxVqSrkoWFRCjDHbg8EFo6Pa
-# q8UL2cVimsvE9+ef+njZZ8s+JV+Een5XXEnvzWb09lxGd5cx9lwZo6dDNu3RCqZ9D5gELlYz9m/VTHtoiULPLVFpdCmjfwbeW4Yy
-# yx1kpXlFbKP45OBjckWtd49qT69gB0a1u1aynMeBRxtZzkOrWM599azwY3lnrKoy76n1oGskvxF0a5WZv1PSAdCN8gefTL494Hfk
-# Jsii0z8ElX8D1Vd1SP5mdE+1eXedWZ7T6f9FUGb8P4JKV/8nQaOr/5fA79DT/5tgpav/n4AbrrgL8/9RUCXPf9PDvOZvm/lvh5Sg
-# 2Rb/HwZNfjfBx85/CM3r4b8psgTNPvHfBqlesz0+PqvU4b894hdxJv+P4v8B2RdBpg==
+# eNqVe3t81NW179q/328emXfmkQcBMpkJEJCQNwQSICEhQBNewxBLoNVJMkkGh98kMxMePmqItKj1VUo91Wt7tEdQT3tbROvjVKKt
+# Fmmr53rQ9uSqfdDj6dN2PLbX+ofX3O/ev50QxPb0Zj7f31r7vfbea6+19m8y/fGDtuq6Rvrxzxve2PO1eXUbPvPYey2l1z9f9NWv
+# LMtLbH76+gaiYSI62F3vJfn3jXqiv5CRvwro0ojaQOtNRLWgn7QSHQD9TR4Riuh+J9GeRURBF1HzAqK1QDuwBegG9gCDwF4gDewH
+# bgDGgCPAUeA24DhwP/BPwEPA14FTwJPAd4AJ4LvA94EfAq8ArwGTwJ8A/0Ki5cB2IA3cC5wB/gP4ECiCjCuAK4ER4EvAKeBl4JcA
+# qyCqBDqBq4GjwAPAM8CvgfzFRE1AEjgOPAX8FPi/QHAJ5g1EgH7gc8C9wCngBeDnwJ8A7xVENUAX0AdcC9wFPAh8C3gSOAu8ArwB
+# /Az4JfBb4I/Au8BfgA8B61IiJ+AF5gDzgRCwGKgC1gDtwEZgM7ANiAK7gE8BMSAOJID9wHXAEeA24BhwL/AA8AjwJPAi8DLwGvAL
+# 4G3gHeB9YArQKonsQCEwDygH6oBVwEagC9gJfBpIADpwABgHbgWOA18DHgWeAp4Dvg/8G/AL4HfAe4B1GVEJUAGsANYB24CrgCxw
+# A3AE+DxwHPgK8CDwCPBN4BngHPAm8J9ADvg/wBRgrcKaAgFgDlAKLAaWAY1AC9ABbAO6gRiwF9CBA8DngQeAR4CngFeA3wPvAu8D
+# 9moiH1AMlAOLgRqgA4gAu4Grgb1AGjgE3AgcAW4HvgjcCzwEPAE8B/wI+C3wPqDWQE+B+cAVQBOwCdgKdAOfAvqBvcAocAi4EbgF
+# +ALwZeBB4OvAaeBp4DngKhx8M866DXAAHqAAmAfMB0qBIFAGhIAwUA7gWBKOHuF4EY4Q4agQjgFBfQkqQ9hOwrITloYgPmEoYWPq
+# uL0BYJ5oObACaARWSpvUBDQDq4E1wFqgBWgF1pFhr9qB9UAHsAHYBHyC2zNgM7ADGAASwF7gGiAJWKUdfAuTsIMy4O2wMW9Fljkl
+# /+ewsRaqzM+X/AfI90qe9+OTvIZF8UveAT4g+aJZfLDcWFtN9lkImGbxZsnPkbJWoP5cUDdfM8nz8Zolz8drLzfaBmb1UzCLL5I8
+# p8VSZp4/d1adRbP4JbPqL5H150q+S461VNYpljyfe5Hcc16/RPJRKSfn90i+WvKFUh9I7le95KOS5+u8U/L9qN8t+WHwV0qej/VJ
+# yXMZdkmer3+P5A+C3yP528B/SvLHwe+W/IPgPy15LvNVkv/GLP5x8H2SfwZ8r+TPzarz1iz+7Vn8n2fxb4Yv8lw3YtPznVXHuuAi
+# 75nF8/W/erot8vslXw4+LvmlCwzdb5DrOSh53ueQ5OsXXMznfU7zr0E2Cz4mYQ9stFXYBAdFhF3woITrvpfyhO75aYvQNYWOClsR
+# pP8S9qKEcoI20DvCdlgpI6hK1wnaSJ+R6cMyPS7TnxNUoVtl+n5Bl9MDgq6gE5KeFHQlPSTr/09BNfqm7O9bkp6S9U/L/h6X9ElJ
+# zwiaT98XtIHOCVpHr8jy12T+T2T6f8v+fi3H+71Mvy3pn4SdXEouQVW6VtIbJT0iqEa3S3pMUIV+KOm/CdpA5wWtoT8Lm+Cje4Q9
+# cNFnQfNwgrgtscMCq8JeVUm6kG4TtInuELSG7hQ0RP9LUI3+XdBymgR1YX/dglppRFCziP1ckH9Mpr8m6Y+E/VsoxsmHlhlUobSk
+# N8vyNwR1088E9dDPBa2jXwgapguC5tMvhb3y0v+Q9Alhb/x0r6AN9KKkLwsbs0yMV4x5PCvpc4I20/OCLqQXiNucFZQSNEDHBdXo
+# S4I66B8EzaOHBV1HZwVdTv8q/Nwi0f986JNBQ/Rjob+rRbpUpoNSjiDqHxQ0TIcEDdFNglbS52X6LkEL6D5BnfQVqS//KMsfEXQN
+# /bOkX5f5z0r6nKC19F1BK+h7ghrzDcr5BuU8gvC8P5D5P5X1/kP285agS+hXMv1bSf8o9Csk/BynqqCNlJV0VObfIuhaelDQFpoQ
+# 9Ap6U9AS+o3wHUH6sqCF9FURCzD6gqAqPSaoRVKVvi3TBjXRq8KvGOMvQfu7pT+5XlCNHhV0Lv1O+BCjXiV2bFjQ+ZKWSlpCfxAx
+# h52eFnHHKlG/Cpr0ReF35kjaTK+LeMTorwaRhS7TNwhaLOrVYIbfkOmXBNXoP4XPWkP/JGgR/YuIZ4x+6rCa3xHUTM/I2Imk3+R2
+# dRv3LTDQFXVGfunHlCdRvlKWB2UsVix9Bi8/gvLNsrxMxiTT/pqXH0f5qyj31fMYRhHxjRYy4ordzELDnj3iRPMSXpYny6IeC+me
+# elGm4sPLnCEjBtnD8mi3Yr2srS9kyLfTkweNsaIP2BEP9wgVZoPfLPtThJ4VhgxZh4NBrltKPnmDw0FuPXZ7ceaUOoyQFakgeWvD
+# oRXg/OR9d5c3TAFl7Nld3gJO1+7yesir6MEO9KIH10MWFzRJFWMswBj7eeyojlKzplLFiO5pRIkDsyPhyyKYb4ANt57z+Nl7FXvW
+# nmMjnt3ow8Z2lbnJzxbvufOSPDtFy2y0kpkwFt/hSNBNj6lezyl1JPhJ6JJN3RV2UiRsp8fqJzVN4bktIrcMuSgpL6PTbeG65bQ7
+# 7L0kB/MLzyGvGi33Ull7Q1sRcS6K1YmUzcVo+7G6NniKraShzhxYtWtf6AQ/qaqs4le6ZwOkceHjBeX+ugVzf034CQ8pLJ/mKO9h
+# 1lehFNKoc8mv1tU9tuacj89NFXn5FFHdFNGwEwtOR0+1RTQ7Rcz5dLr7VH/EPJdOL3/doim9UIKRakb7rQ7zbrONQqjhLeQ7tx9S
+# FsPK9Vr56syB9+61quCKwHnf14MB0JA1HzvuReQRyrOT33bvPfesOfdAr43RcLVKxTY9WADrEWJOiubZUFOD7RjfFLBRyw8e0T1+
+# 7JbNrnt8nDrO/ugHX3/xaa+dPRNxzqWGN7fSpNPB9Oqr6XtOh+t08/hL42t/8K2zH+jBT8NS2dx+y8AUYp0bnSRzLH73PyJn+V80
+# zKBCYU+yZxuuWoBVysNuN1psFDCNrfXaAvaxZ/UeGz36/WMmtza+8+yXVro1suytUCy36j1murBHh34zmnS7mXcBl9Vrr3iTveld
+# 4C2UqVNRxnU6j6KqjXo1jXpNGg23KFQb1YOF0FyXOGX8HPWFjDtHJBimq9liqkXfxu7qnlVij3lMZuj3YMi4D3lpT0sp7WwNQTNV
+# 1NA9K2GdbGwlqwbfLHnof8WOlkJ4IRNF1nkooI6tXaYoapNipkJlzH5ardAKlZb7RhTczZRVGKVnfaEYFesT2LO+FHEBvwU6THpw
+# Pu5bLowaEvLw9eLy7Ic83HZGx3yYU+RwGb3BmDLJmPW0J3oYefmvI33K42Nja0aCPfxMUfTwImqELYocLqF6If2usRJ6nZE17MWZ
+# GF9E4XzQwwt5nhbObwTv4rw5nL8SPOIF1sAa6HWFaa+rzBw9EqA7F2w34ZSAmzSrbNKisDsPbLdoZpmjIEe5JEdFfYM3qRryTYJX
+# VdMk1ufO0HYF54wxVvGSS+wS36fbQiTi35SHW17d8wlh3Wim/Asz5SFRvkmWz8dK8f29G9leOAqrdS7WlUfo9jzc2aas9nnQTxO8
+# VnTMC0uqqHw1+X4upg+UHWMLqEARt2eF5/XcsoB43n3Yg8/CXlVco295xEEsMlZAXifu284m1GKvVDh4zkOweH728ksvrR4J7hKr
+# v+u2AmjZEupTqsnralTmi1R03E8jQRf2MHrYL1LtiuK6Wq2ic8+frQ2oj7f9sLZTYS5eOuKxC9s44vFw6h7xuDm1jHicnJqv9iwj
+# sfcBdsHrb9g+iP581K4qLHp7ObU7nexhp9Nzznn21U6ex8sUhd0SGgl2w6falVtD0ZuKUF9lDeEqErxTZac2d+I5XbJKLaXI7YiU
+# Xy0BddLpV6O3O0Tfp8DNoU6HU43eDmt6BNb0DsOavkU27fb2rZpT9fq9rop/nR45elOx6HO87sXayE1lNF5XCR1YjTMCL1O9kYq4
+# PjOvE23uiYw5hZaf9oxjXVPem5rOeY6S18+tPs6c0MwSzDcIuWHV6/i4tWRTeCp6+0VZ/kA25+0/3epURd8Vv4qMwQ4fzid+Wu5y
+# 8t20X0xDBb04I/OgPQ07roSWYA0UUlcpzRQZwxoojUJzIoexDmXRI1gHTVNPtW6EWkbHeIrUAC1pU/zwXuMeOqccDY60OOidQVvA
+# V4Bjh/iKrVMKYWFUP/m8ONka7nRFJlJMAVKKzcR+wq5jv85a+VuXCpuo6dWMGrz0ukm1kLEnFQ2eyFREirmYuE5X/POltbyWgPnG
+# Nl6j4UoLJCvnb3EsiMhhKbADjFnG8wMKrR0JXsl9Fj3iZyTkD5BFzBm1p2s+6vFq02vO9wOrOBUd5+uiWHCCp7itKYOPY8ry2u8S
+# 37XTQcTkgejhObw9PcQczIfgaZmP5a/yHaNKH/Ov9kF+H2KVQkhdAqkLzKTMsWAGxZiBitN4GwV8Y2sfYcz/kA8NmP+bG9Y+zJiP
+# w1/wzQ2xNScZK/AX3HvPrrWVhb6C1YU2eqjAV+AvfPml29Y+XFBQWKEqBfkUKIy1PezzFQYK32k9CRo54qGHNc13tJ2PP/7uOS/q
+# mk8qSgE/tQuhP0dD40+cKzhpNhdwiQKWG9t4ySBO29EBxWLIN5455zupqgUBZpTWYP5H66KHvbQRM/YVwItj18uX28x8xwNF2AsF
+# +6v6yFdIxp5j1iyuFBRhx5UiC83suftvrcuk4mOKGa21QvSGPMsc6EEJyoqwZq1TM+1kG77uk5Y5TCkqQflfPpzpk5dBksiYh9/T
+# Co7SG2533itTF+gNi935yoHf0xvmorxXBi6Q1F674sCI7hJq+GCJcSpUcgjLwE+FWnLxVNRExx1cNxynymZOBYJCryZ0/9vQbznT
+# SYeDKSVuqvhxBOdtNeLVXgdODfjXnWSN3rEIfS6EdXPhjAcochPyC1Rz9Kb55HXzefl8AIw6138rIk4rTpMV586KM5N1WmDjY7in
+# FCiMvhMcAhfD7Ub6AuWZYzxvqYjpTCKihXMIGe8K9epa8iguEUlzv2sNS1+DmMEzyxdNl7tmyssvKS+Sb0D9KP/qTKyIvVMKEQvO
+# QywIn9zGfTJPva6q1ogGqmlaxOSmYyaTl8eHj8bHd0bMdjpmNvsiFqT3jw+MF560mizji0/azHnHGMsfzz+mKP7x0NnCs4uj9kXU
+# abKrnE46VNZptjsED/vXabU7Be9SVeS7ombwdlXrtJrtgreqpk6orODdqrnTZHZHTYu4D7d02kzmqGkhdTKTGlVBFdUhqEV1yrQr
+# qvC0Yhc0T7EKyhR3lPE0ogfmos4A0zidVDQGXpG8MsPDnvI6ETaPWxq2C9TFvazYo9qw8V76amjzruowRaqd4k2CCzlXUKTGI24t
+# y2DJm5hb5nEP8gZCAx9zELdj3DOHGaKeGp+k5aCIfGockhZLWiR8TB55vdw3+Qz/8b7uWS5GnI4T14WN991RnJRoK/zOOqfwO7CJ
+# rJORKdpSLvJ1z6jw5ZCw9VxZQHmu5WyZUV4s2yGiUxTF28alDMMSTfeCcc1GTR81mnF36TB6Q5xujrQijlhXzE+c6VTZeP65gmir
+# sNum8fwXCyryeV1eR8aKjPdZgHbXDUyazVPjA51m9NuBPtE3TqXpFuKxgQen51bqJLPJiJ35PCNh4w6MeDgYop1lpYgs7dNRK/ot
+# hax78HSJ9+xGmyvDxvcMuqfJ8NmIMD3TETR2zjYdQSMWwx57KhQelc2nnesQbStzaA+ibh6R9awrxJ0M99KWAtqJaHwlJNnTOhMz
+# E4+ZW3AXXomReTSoSZ3hMvSFjXu9l1aqKiF+YrqHv4WyKQ24herBheQjhxIMBalRQSzucxvR6B/d4rsDRehdMmy85x8Rb9WhR+Kt
+# u4PVedBCcSsh/l6kuoqqsWdL0MbrdSsm+T1ENmx8b8LfYtdAupTowcvSHv5Gz6Y0wh6kPfytrUMpVapQY4jfosFzif44tTMUAv3d
+# lBG9hGDJhj38PXZMqYSt6qOg6sD9E2sc7Kcgeo6pS0V+teaYydODvVh3fjOPi9Hz5fcuPJa+Pmx8x+SH/6CpQdhhL+3FbTvA7m8d
+# ZFWgY2sH2TLysW00yK6AJ1xMIcxk2HON+NanRqwMt7CGRZ2O0W8NG/Z0+l0G1wmER3QH8vfx76G0JEYaCW4XN6hGfoPqM/ZGE3vj
+# Envjn9kbfubEGuS4Pn0KtRzMqzTi9r1ScdMcld+Qo5DGoVS851R1z06M52AV7zRCj7z5enAvRtODCdgP9BgupkbVRaVKMfIWY/42
+# ZRWi0FNeFqxQnBA/xPgZq+CjKMPBGvEWBVHhn4arl1KtqrcsIH+wV+Pvsapwkx7kWh1MCr1zyfdRXP8WiXfKqvherljo4+YbFy/b
+# LNeC6KGw8V1bo9ZCXo9cC5wArMUKL/19q3G5pH7l5Zcc4t3N/4/MqtSJJ8PG9xOztVXqKnZpwbSuslJm6CoTPGSCb+Nnj+G5gudC
+# 0hJIap9JlyolGPEK7EPFpNH7PukrYYTE2C+Eje8W+V3tCTaI29Je3J0GcTca1LgG3sV4tLkdkngj3Ep6wXGd5Hd5vhqDoL2M9zwi
+# bC2PVVexMPXi1q0HddS//IytVKyyfJhLlhdS52N1KmGB9WAbbhS8j4qfuWgpE6/rXVSrcKFrgRuQpaSbjh6MNXd20RHGC3pONDO/
+# +yArcDOvm811NysH5tFdiApdz584fz7B8t3M5z74TiLRwwLu5uYTz6/IKPYDU3Qj+nuLV2vuOc+bHSymh5FCP3dX4tHcyQrdLGBv
+# ode4HD/mjz/w6omDJ06cwIiVlT0H39n7fOXqzgsnEgc7WSlGPsgCLsW+awr9Ta1GD+sdL15InO+8cKG5J8HmuBPPQ5rz58+/g4ph
+# 10+Vaz9UAh+yee4EWjs+zZa6Uaw8e+M8OszEl6gu+nc+Iv1EPB9nFvk21HX+KCTkYEXuqSnQBH0XVTp7lmGOkO1EM70kFuf5KZ6x
+# 1H2BLvAuXjcmmDhxoYe6eQPUpRpR8SgiNdd8FnLjLLl6mjs7OyuV5+gA8WhgBaqewCqWds7vfLWys/O/Ku+++4Siz6PNosDvvrsH
+# 6Wvn0R5073UnMMT8HlpkfPnrevw8xvtgrbBRV0gbWCipKimTZ2H6va4iwd/XapJOv7stlvVXyPY83yLz3JL6JPVLukRSTdKlkldm
+# PiTuZZZZYxmfaTkayCSpIn2Ukb9C9GeS/VqlTFbxTaLx3btD1DLALc1K0W++8R5atvNIOv09fDGec2ReiaRBKfNSIYHRvkHK0YBa
+# iqjbQDANasXibrI29yUTeiK7hszNBtXWNK1porzWyIZ1VzXij1gbmdvWb4muj5DStolMbV2tm7cRayelvZ1YB6kdHR1k3tC1a9vG
+# HWTbuKM7mmpLJVNpYptI2dQBbCJ1Ex6mTfwP6S5inyDWRUoXSrqQpeHBk58Auqi4K6b3p1OJ/qq+lJ6N69mqNk4PZpuo9LKidDxT
+# FYlnUqPpvnimiYIzFQbTseGhRF+mal0iuy82XI4+BhKDTbN6/0iN2b1/pGjHUKw/nm6ihR9TITma3hzLXNORSGbj6XKebKKy/65e
+# E5VfXqUtpu+PZcq742lMdnOqP/6xwhq1mqjoY4r4sjfRvMtLZo88//LibbGEni1vTSYG9Y/tWJQ3UejyEmNlyqOJZPyvSjy9eiWX
+# F0UPDccHYn1o55spTGWqulKp4fglMxnNJpJV7YnMcDJ2aHM8m0bjJloyU7w/ET9Q1TaUSsdTom+I1JGO7Yu3xZLJ3ljfNU0092/U
+# nT26KO3Go4kWXJ65IZ0aHcbWHUqNZrfFMMIlG3FptdlrMVOCRnG+lItnig4k+gfj2SohrtHxR/qv6OpL7asaSEDTszGoRrqqPzGY
+# yMaSaexKVQSPNsylvObvrlnbRFV/X03OGGux8O9qwFWkP5bcn7imKqbrqWwsm0jpVev1vmQqk9AH25KxDCYU/lt1sLlDqX6upZdX
+# 2qTr8bTspOxjyjfH9/XKCtwWzPuYKjug4rHsKBc1v2tvbH+sKhnTB6tkp55ZWZtj2SFuTy7mbEntGO0b6kjEk/3rD/bFh3mHTeSd
+# VWNr7954H3bXPysvMqrrsd5k/NKaO6DCurBGH81bN5pIiuNySfVDmWx8H5/Sxbx0fKDqynjsmkh8IA6l4ofobxY3XzIYipOQtUpM
+# p4kCRpE4Zq3pdOxQVyKT/SvZzdPzE9mboAyxbOqiwCI3AvVOQeC8zVu3bN2xrbVtPZm3bI1sbu0i57S2LOPVyTqtZJQXjWxq3bKh
+# a/0OYt2kdHeQqbuDOxe1uwPeoRvOopu7kW7hRqyCcA65XfzRQ2Y8OjrgYrrhSbq7ULWrA0217i7UcPKn/GwSmV281x407YFH6iEF
+# RO3pArN7HQDPtRtd7d5B9lgfnEumIxkbzJAa6+8nCx5CZnNseDiu95MWSw/2IpXpw/EmUywLhUIym431DZHDoBvj3A6SixukQVgI
+# 3ehC602OxsnUy/edbIK0iua2voFBOIMM1IwUdGPuG4qlW9F7XzIeS5Pal0qCF67WJkg0Be9LGviMKMjUk7NPuL22Iex5vJ/njkI+
+# R186HsvGDeeGvg+QpT+uZxLZQ5wx5pDXH+dCtyaTpPYn9qEgJWwUCtKxA4aHN3N2S4asnEbhocnBOe7BElgxcqJTnLV1owPQQcg0
+# kEzxVgO8H6wk7B7Z8GgbEnMm5zTfJqS08iQ/mEYlIwYgD/j2eF8ShrRfKC/l85xLXAPZkbVJh6mC3otuN0PJDK9CeUgaZpgcYGeC
+# B1Fvxyiq9IlBfUhemYAaH+hOZBK9iaRYnsFkCkYcKzmYPDQ8BJKOx3WyDMUyW7h0nOEKTaYh7PYuUocy+0lN9B8kB7qKH9w6ICZI
+# tgS8eDLRj10gbyLTKhQk3h9NGSOSJZHZMZQ6oJM1Ic8XaZAKi8Kf7VhksnAugrpqEhKY8RjMDiGRyJK6L3aQrHhsH431Y6H3QSDr
+# vkNyAcz6BiG7pvPttOoxPRVNgNN0PoM8/uxIpmKYDGc3YZ0UfYQsqYEBvorkTemXietP6e1xI68jndonc83I5ZI6U/qOxLXxaSUs
+# SOkXV7R1ECs4iGXop+KU/tH1ntHbYR6BkDacwhLk8+cl7p3MPAv1tBFMmPK4U9oxHEeGCi0hczq+L7U/Tj6DXtrUZmSKo2jh7g2W
+# Cc1wpq3pVNboxZzm/gOHVJxa0tKpA1jV9Cg2Hg8dVpu0TAwjmDJ9sWSc7BkoxfTRdWbi2VZhQBJwA2TNcF3mpydPcPx40lywm/YN
+# p9LQ2GxHKj1d31A63sPFCE60M2IqcoDl506EbnxYkeKLbSRkeEWuDNflZHJLytAd3m50GA4njhADsvMGpsxwDAoHwqdswuHJ8qJs
+# ahgjjvZmhHciJVtNGg4iDn02ZXgsMo8OC0U2QaXLB8nGyZBh7ETWfkG4kdsPywA7wMOhDN3HPvOZ9sbrQnwbYENDq0I4IKGlIUQa
+# w4mk8NeV+xBUioLe0UEU4XRVQsn6rsmM7suEVg3Ekpn40hDUuzI2nAitql2+NJQZilXWoEmsNxbrrV++srch3ttf399f29u7sqY3
+# Vh3vXz5Q31C7YsVALBav74uh1/3GTqFR47Lly2or++P7QzdQY+7MydyZR3NnHsudeTx35tu5M0/kzjyZO/N07sy/5M58J3fmmdyZ
+# M7kzE7kzz+YmxnIT47mJm3ITn81NfC43cTQ3cXNu4tbcxOdzE3fkJu7MTdyVm/hCbuJYbuKLuYnjuYkv5Sb+ITfx5dzEfdU1tXX1
+# DSsaV/asWhZaveSKyuY13zt5/fMPkbKQvcvmskKmhMHMiSjlyj6NnmLzjfR2JQRSVCayi55ihduNBlphZ+HGwsZCTVkg2hcFiTFm
+# uStYOTam3T93GXtmLimMWe8KsruCVcibnFvN3p9L85nHJl8TXvLx/JW8j+TXoKeH59XSbfMZ3Rxk9FyYsbfDjD4ot2i/Wci0mxcx
+# 7WHgzTrG/lzHtOP1Cj1er9LYCkbHG1FvJaNTq2yURxVFbKP45OFjcEWdN49pr61mh8e0b6xheS8Ar7SwvLdaWd7jTcz6fhPL+8U6
+# 8M2s8D3jHvzzWuPO+xvQnOTfn8VP8f/5r5P3aklLQYPyn7CZfIvC/2+7CHlLP5JfJfMbp/9pW/511V+sQ/J//tvrjTv77PacTv8O
+# SZn1WySVLv4eSaOLv0ni7w6mf5dkpou/TcI9XrzX5L9PUiXP/9+NeYzfJ/D/q1OCxlj890ta0Hj/wNeHvyzg/fD/xzMF5TsRyKp6
+# jDH4/MyyTrTeeAHB5G+o/h8/w+R/
 # __DEX_END__

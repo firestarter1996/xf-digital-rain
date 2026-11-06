@@ -14,7 +14,7 @@ __min_version__ = "12.5.1"
 import base64
 import zlib
 
-from java import jclass, dynamic_proxy
+from java import jclass, dynamic_proxy, jarray, jfloat
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
 from client_utils import get_last_fragment
@@ -235,13 +235,13 @@ class DigitalRainPlugin(BasePlugin):
 
     def _hue(self):
         Color = jclass("android.graphics.Color")
-        hsv = jclass("java.lang.reflect.Array").newInstance(jclass("java.lang.Float").TYPE, 3)
+        hsv = jarray(jfloat)([0.0, 0.0, 0.0])
         Color.colorToHSV(_jint(0xFF000000 | self._color()), hsv)
         return float(hsv[0])
 
     def _set_hue(self, h):
         Color = jclass("android.graphics.Color")
-        c = int(Color.HSVToColor([float(h), 1.0, 1.0])) & 0xFFFFFF
+        c = int(Color.HSVToColor(jarray(jfloat)([float(h), 1.0, 1.0]))) & 0xFFFFFF
         self.set_setting("color", "#%06X" % c)
 
     def create_settings(self):

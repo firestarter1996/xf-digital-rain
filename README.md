@@ -28,6 +28,10 @@ On a Pixel 6 Pro in a busy forum topic, scrolling stayed the same with it on and
 
 The header rain redraws at most 16 times a second with fewer streams. On the 6 Pro the chat list screen used about 8% of one CPU core more with it on, because the app's glass effects redraw with every frame. It stops the moment you leave the chat list.
 
+## What's new in 1.1.1 (11-08-2026)
+
+Fixes Nagram XF force closing while a chat was being drawn right after the app opened. The hook that keeps holiday snow off the rain was installed from the plugin loading thread while the UI thread drew snow every frame; a frame that met the half installed hook crashed in XposedBridge with a null original method. The rain core still loads off the UI thread, and every hook is now installed on the UI thread, between frames.
+
 ## How it differs from Custom Snow's Matrix mode
 
 Custom Snow scatters single green characters as particles over the header. Digital Rain draws real falling columns, leading glyphs and fading trails behind your chats and the header, so it replaces Custom Snow. Where the rain is on, holiday snow is not drawn over it.

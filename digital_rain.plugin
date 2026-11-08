@@ -2,13 +2,17 @@ __id__ = "digital_rain"
 __name__ = "Digital Rain"
 __description__ = "Movie style digital rain behind every chat and the main header: mirrored katakana, digits and symbols falling in columns at different speeds, a bright white leading glyph with a soft glow, trails that fade to dark, and glyphs that flicker inside the trails. Pick any color by hex or slider, rotate through colors, and set the rain speed, color rotation speed and particle count. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __min_version__ = "12.5.1"
 
 # Performance first: all drawing lives in a small embedded Java view (no Python per frame).
 # It runs on vsync only while its chat is on screen and the screen is on, redraws at most
 # 30 times a second, allocates nothing per frame and draws glyphs from two atlases built once.
 # Python only runs when a chat opens and when a setting changes.
+# 1.1.1 (11-08-2026, XF force closed while a chat was drawing right after start): the hook on the
+# holiday snow's onDraw was installed from the plugin loading thread while the UI thread was drawing
+# snow every frame, and a frame that met the hook half installed died in XposedBridge (its original
+# method was still null). Every hook is now installed on the UI thread, between frames.
 # Logcat tag: DigitalRain.
 
 import base64
@@ -18,6 +22,7 @@ from java import jclass, dynamic_proxy, jarray, jfloat
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
 from client_utils import get_last_fragment
+from android_utils import R
 from ui.settings import Header, Switch, Divider, Input, Custom, Text
 
 ENTRY = "com.firestarter.digitalrain.RainCore"
@@ -51,16 +56,36 @@ def _parse_hex(s):
 class DigitalRainPlugin(BasePlugin):
 
     def on_plugin_load(self):
+        self.alive = True
         self.core = None
         self.rows = {}
         self.refs = []
         self.headers = set()
+        self.install_run = None
+        # the embedded core (decompress and dex load) stays on the loading thread, off the UI thread
         try:
             self._load_core()
             self._sync()
         except Exception as e:
+            self.core = None
             _log("load: %s" % e)
             return
+        Looper = jclass("android.os.Looper")
+        if Looper.myLooper() == Looper.getMainLooper():
+            self._install()
+        else:
+            self.install_run = R(self._install)
+            jclass("org.telegram.messenger.AndroidUtilities").runOnUIThread(self.install_run)
+
+    def _install(self):
+        try:
+            if self.alive:
+                self._load()
+        except Exception as e:
+            _log("install: %s" % e)
+
+    def _load(self):
+        """Hooks only, on the UI thread (the core is already loaded)."""
         ca_cls = find_class("org.telegram.ui.ChatActivity")
         ctx_cls = find_class("android.content.Context")
         plugin = self
@@ -126,6 +151,12 @@ class DigitalRainPlugin(BasePlugin):
             pass
 
     def on_plugin_unload(self):
+        self.alive = False
+        try:
+            if self.install_run is not None:
+                jclass("org.telegram.messenger.AndroidUtilities").cancelRunOnUIThread(self.install_run)
+        except Exception:
+            pass
         try:
             if self.core is not None:
                 self._call("detachAll")

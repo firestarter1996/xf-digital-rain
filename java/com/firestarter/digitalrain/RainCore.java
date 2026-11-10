@@ -23,7 +23,8 @@ import java.util.Random;
 /**
  * Digital Rain chat background. One view per chat screen, placed right above the wallpaper.
  * Runs on vsync (Choreographer) only while the view is attached, shown and its window visible;
- * draws at most 24 times a second; nothing is allocated per frame; glyphs come from two
+ * draws on every vsync from a clock driven by the vsync timestamps, heads glide by sub pixel steps,
+ * and it skips vsyncs only while the app is missing frames; nothing is allocated per frame; glyphs come from two
  * ALPHA_8 atlases (sharp + glow) built once, tinted by the paint color.
  */
 public final class RainCore {
@@ -114,13 +115,20 @@ public final class RainCore {
         Bitmap atlas;                                       // row 0 sharp glyphs, row 1 glow
         float[] verts, texs; int[] cols4; short[] idx; int maxQuads, nq;
         int cw, ch, cols, rows, nGlyph, glowPad;
-        byte[] glyph; float[] lit;                          // per cell: glyph, time last lit (s)
+        byte[] glyph; float[] lit;                          // per cell: glyph, rain clock when lit (s)
         float[] headY, speed; int[] col, len, lastRow;      // per stream
+        byte[] headGlyph;                                   // per stream: the glyph the head carries
         boolean running, posted;
-        long t0, lastDraw;
         int seenVersion = -1;
-        float last = -1;
         float dim = 1f;
+        // 1.2.0 timing: everything moves on a rain clock advanced by the vsync timestamps, so motion is
+        // continuous at any refresh rate and pauses (instead of jumping) while the view is hidden
+        float clock = 0f, flipAcc = 0f;
+        long drawNanos, lastNanos;                          // vsync time for the next draw, last drawn
+        // frame budget: draw every vsync; skip every other one only while frames are being missed
+        long prevVsync, periodNs = 16_666_667L, minInterval = Long.MAX_VALUE;
+        int stride = 1, minStride = 1, frameNo, winFrames, winLate;
+        long drawEma;
 
         RainView(Context c) { super(c); setWillNotDraw(false); setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO); }
 
@@ -165,7 +173,7 @@ public final class RainCore {
         }
 
         void ensureBuffers() {
-            int want = Math.min(16000, headY.length * (rows / 2 + 8) + headY.length * 2);
+            int want = Math.min(16000, headY.length * (rows / 2 + 9) + headY.length * 2);
             if (verts != null && maxQuads >= want) return;
             maxQuads = want;
             verts = new float[want * 8]; texs = new float[want * 8]; cols4 = new int[want * 4]; idx = new short[want * 6];
@@ -176,10 +184,11 @@ public final class RainCore {
             }
         }
 
-        void quad(int g, int x, int r, int row, int argb, int gw, int gh) {
+        /** One glyph quad; y is the cell top in pixels (fractional for gliding heads). */
+        void quad(int g, int x, float y, int row, int argb, int gw, int gh) {
             if (nq >= maxQuads) return;
             int v = nq * 8, cI = nq * 4;
-            float l = x * cw - glowPad, t = r * ch - glowPad, rr = l + gw, bb = t + gh;
+            float l = x * cw - glowPad, t = y - glowPad, rr = l + gw, bb = t + gh;
             float sl = g * gw, st = row * gh, sr = sl + gw, sb = st + gh;
             verts[v] = l; verts[v + 1] = t; verts[v + 2] = rr; verts[v + 3] = t;
             verts[v + 4] = rr; verts[v + 5] = bb; verts[v + 6] = l; verts[v + 7] = bb;
@@ -196,6 +205,7 @@ public final class RainCore {
             // a header holds a few rows: scale the streams to its height (a phone screen is about 60 rows)
             if (dim < 1f) n = Math.max(12, count * rows / 30);
             headY = new float[n]; speed = new float[n]; col = new int[n]; len = new int[n]; lastRow = new int[n];
+            headGlyph = new byte[n];
             for (int i = 0; i < n; i++) spawn(i, true);
             ensureBuffers();
         }
@@ -206,6 +216,7 @@ public final class RainCore {
             len[i] = 6 + rnd.nextInt(Math.max(4, rows / 2));
             headY[i] = anywhere ? rnd.nextFloat() * (rows + len[i]) - len[i] : -rnd.nextInt(rows / 2 + 1) - 1;
             lastRow[i] = (int) Math.floor(headY[i]);
+            headGlyph[i] = (byte) rnd.nextInt(nGlyph);
         }
 
         // ---- lifecycle: run only while it can be seen ----
@@ -217,10 +228,20 @@ public final class RainCore {
         void update() {
             boolean want = isAttachedToWindow() && getWindowVisibility() == VISIBLE && isShown();
             if (want && !running) {
-                running = true; lastDraw = 0; last = -1;
+                running = true; lastNanos = 0; drawNanos = 0; prevVsync = 0;
+                try {
+                    android.view.Display dp = getDisplay();
+                    float hz = dp != null ? dp.getRefreshRate() : 60f;
+                    if (hz >= 20f && hz <= 250f) periodNs = (long) (1e9f / hz);
+                } catch (Throwable ignore) {}
+                setStrideFloor();
+                stride = minStride; frameNo = 0; winFrames = 0; winLate = 0; minInterval = Long.MAX_VALUE;
                 if (!posted) { posted = true; Choreographer.getInstance().postFrameCallback(this); }
             } else if (!want) stop();
         }
+
+        /** The header moves at most 60 times a second (the chat list's glass effects redraw with it); the chat rain every vsync. */
+        void setStrideFloor() { minStride = dim < 1f ? Math.max(1, Math.round(16_666_667f / periodNs)) : 1; }
 
         void stop() { running = false; if (posted) { Choreographer.getInstance().removeFrameCallback(this); posted = false; } }
 
@@ -228,19 +249,42 @@ public final class RainCore {
             posted = false;
             if (!running) return;
             if (getWindowVisibility() != VISIBLE || !isShown()) { running = false; return; }
-            if (nanos - lastDraw >= (dim < 1f ? 62_000_000L : 41_000_000L)) { lastDraw = nanos; invalidate(); }
+            // frame budget: count vsyncs that came late (missed) over about a second
+            if (prevVsync != 0) {
+                long iv = nanos - prevVsync;
+                if (iv < minInterval) minInterval = iv;
+                if (iv > periodNs + (periodNs >> 1)) winLate++;
+            }
+            prevVsync = nanos;
+            if (++winFrames >= 64) {
+                if (minInterval > 4_000_000L && minInterval < 34_000_000L) { periodNs = minInterval; setStrideFloor(); }
+                boolean heavy = winLate > 6 || drawEma > 2_500_000L;
+                if (heavy && stride < 4) stride++;
+                else if (!heavy && winLate <= 1 && stride > minStride) stride--;
+                if (stride < minStride) stride = minStride;
+                winFrames = 0; winLate = 0; minInterval = Long.MAX_VALUE;
+            }
+            if (++frameNo >= stride) { frameNo = 0; drawNanos = nanos; invalidate(); }
             posted = true;
             Choreographer.getInstance().postFrameCallback(this);
         }
+
+        static float smooth(float x) { return x <= 0f ? 0f : x >= 1f ? 1f : x * x * (3f - 2f * x); }
 
         @Override protected void onDraw(Canvas c) {
             long st = System.nanoTime();
             c.drawColor(Color.BLACK);
             if (glyph == null || headY == null) return;
-            if (t0 == 0) t0 = st;
-            float now = (st - t0) / 1e9f;
-            float dt = last < 0 ? 0 : Math.min(0.1f, now - last);
-            last = now;
+            // time comes from the vsync that asked for this frame; a redraw without one keeps the same frame
+            long fn = drawNanos;
+            float dt = 0f;
+            if (fn != 0 && lastNanos != 0 && fn > lastNanos) {
+                dt = (fn - lastNanos) / 1e9f;
+                if (dt > 0.25f) dt = 0f;                         // a long stall pauses the rain, never jumps it
+            }
+            if (fn != 0) lastNanos = fn;
+            clock += dt;
+            float now = clock;
             int base = color;
             if (rotate) {
                 Color.colorToHSV(color, hsv);
@@ -250,34 +294,39 @@ public final class RainCore {
             int br = Color.red(base), bgc = Color.green(base), bb = Color.blue(base);
             float mult = rainSpeed;
             int n = headY.length;
-            // advance streams; each new row a head enters is lit with a fresh glyph
+            // advance streams; each new row a head enters is lit with the glyph the head carried there
             for (int i = 0; i < n; i++) {
                 headY[i] += speed[i] * mult * dt;
                 int r = (int) Math.floor(headY[i]);
                 while (lastRow[i] < r) {
                     lastRow[i]++;
                     int rr = lastRow[i];
-                    if (rr >= 0 && rr < rows) { int k = rr * cols + col[i]; lit[k] = now; glyph[k] = (byte) rnd.nextInt(nGlyph); }
+                    byte g = (byte) rnd.nextInt(nGlyph);
+                    headGlyph[i] = g;
+                    if (rr >= 0 && rr < rows) { int k = rr * cols + col[i]; lit[k] = now; glyph[k] = g; }
                 }
                 if (headY[i] - len[i] > rows) spawn(i, false);
             }
-            // a few glyphs inside the trails change at random
-            int flips = Math.max(1, (int) (cols * rows * 0.004f));
-            for (int f = 0; f < flips; f++) { int k = rnd.nextInt(glyph.length); glyph[k] = (byte) rnd.nextInt(nGlyph); }
+            // a few glyphs inside the trails change at random, at the same rate whatever the refresh rate
+            flipAcc += cols * rows * 0.004f * 24f * dt;
+            while (flipAcc >= 1f) { flipAcc -= 1f; int k = rnd.nextInt(glyph.length); glyph[k] = (byte) rnd.nextInt(nGlyph); }
             int gw = cw + glowPad * 2, gh = ch + glowPad * 2;
             nq = 0;
-            // glow behind the leading glyphs
+            // glow behind the leading glyphs, gliding with them
+            int glowA = (int) (170 * dim);
             for (int i = 0; i < n; i++) {
-                int r = lastRow[i];
-                if (r >= 0 && r < rows) quad(glyph[r * cols + col[i]], col[i], r, 1, Color.argb((int) (170 * dim), br, bgc, bb), gw, gh);
+                float hy = headY[i];
+                if (hy > -1f && hy < rows) quad(headGlyph[i], col[i], hy * ch, 1, Color.argb(glowA, br, bgc, bb), gw, gh);
             }
-            // trails: bright just behind the head, fading into dark color
+            // trails: bright just behind the head, fading continuously into dark color and then to nothing
             for (int i = 0; i < n; i++) {
                 float sp = speed[i] * mult;
                 float life = len[i] / Math.max(0.5f, sp);
                 int x = col[i];
-                int rTop = Math.max(0, lastRow[i] - len[i]);
-                int rBot = Math.min(rows - 1, lastRow[i] - 1);
+                int lr = lastRow[i];
+                int rTop = Math.max(0, lr - len[i]);
+                int rBot = Math.min(rows - 1, lr);
+                float emerge = smooth((headY[i] - lr) * 1.5f);   // the newest cell comes out from under the head
                 for (int r = rTop; r <= rBot; r++) {
                     int k = r * cols + x;
                     float age = now - lit[k];
@@ -285,22 +334,27 @@ public final class RainCore {
                     float b = 1f - age / life;
                     float lum = 0.22f + 0.78f * b * b;
                     float lift = b > 0.85f ? (b - 0.85f) * 1.1f : 0f;
-                    int a = (int) ((30 + 225 * b) * dim);
+                    float fa = b < 0.15f ? b / 0.15f : 1f;          // last stretch fades to zero, no pop
+                    if (r == lr) fa *= emerge;
+                    int a = (int) ((30 + 225 * b) * dim * fa);
+                    if (a <= 0) continue;
                     int cr = (int) Math.min(255, br * lum + 255 * lift);
                     int cg = (int) Math.min(255, bgc * lum + 255 * lift);
                     int cb = (int) Math.min(255, bb * lum + 255 * lift);
-                    quad(glyph[k], x, r, 0, Color.argb(a, cr, cg, cb), gw, gh);
+                    quad(glyph[k], x, r * ch, 0, Color.argb(a, cr, cg, cb), gw, gh);
                 }
             }
-            // leading glyphs: white tinted with the base color
+            // leading glyphs: white tinted with the base color, at their exact (sub pixel) position
             int head = Color.argb((int) (255 * dim), 225 + br / 9, 235 + bgc / 13, 225 + bb / 9);
             for (int i = 0; i < n; i++) {
-                int r = lastRow[i];
-                if (r >= 0 && r < rows) quad(glyph[r * cols + col[i]], col[i], r, 0, head, gw, gh);
+                float hy = headY[i];
+                if (hy > -1f && hy < rows) quad(headGlyph[i], col[i], hy * ch, 0, head, gw, gh);
             }
             // one draw call for every glyph on screen
             if (nq > 0) c.drawVertices(Canvas.VertexMode.TRIANGLES, nq * 8, verts, 0, texs, 0, cols4, 0, idx, 0, nq * 6, paint);
-            frames++; drawNs += System.nanoTime() - st;
+            long took = System.nanoTime() - st;
+            drawEma += (took - drawEma) >> 3;
+            frames++; drawNs += took;
         }
 
     }

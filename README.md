@@ -22,11 +22,21 @@ A plugin for Nagram XF. Movie style digital rain as the background of every chat
 
 ## Performance
 
-All drawing lives in a small embedded Java view, so no Python runs per frame. It ticks on vsync only while its chat is on screen, redraws at most 24 times a second, stops completely when the chat is covered or the screen is off, and allocates nothing per frame. Every glyph on screen goes out in one `drawVertices` call from a glyph atlas built once.
+All drawing lives in a small embedded Java view, so no Python runs per frame. It ticks on vsync only while its chat is on screen and stops completely when the chat is covered or the screen is off. Every position comes from a clock driven by the vsync timestamps, so the rain moves at the same speed at 60, 90 or 120 Hz and simply pauses while it is hidden. Nothing is allocated per frame, and every glyph on screen goes out in one `drawVertices` call from a glyph atlas built once.
 
-On a Pixel 6 Pro in a busy forum topic, scrolling stayed the same with it on and off (median frame 29 ms on, 26 ms off; janky frames 23% on, 41% off), and idle CPU stayed within the normal swing of the app.
+The chat rain draws on every vsync. When the app starts missing frames (a heavy scroll, a busy chat) or the rain's own draw time grows, it skips every other vsync, and up to three in four, until frames are on time again; motion stays smooth because positions follow the clock, not the frame count. The header rain moves at most 60 times a second with fewer streams, because the chat list's glass effects redraw with it, and it stops the moment you leave the chat list.
 
-The header rain redraws at most 16 times a second with fewer streams. On the 6 Pro the chat list screen used about 8% of one CPU core more with it on, because the app's glass effects redraw with every frame. It stops the moment you leave the chat list.
+## What's new in 1.2.0 (11-10-2026)
+
+Smooth motion. Earlier versions redrew at most 24 times a second (16 in the header), and the bright head jumped a whole character cell each time it reached a new row, so the rain advanced in visible steps. Now:
+
+* The head glyph and its glow glide down by sub pixel steps on every frame.
+* The newest trail glyph comes out from under the head instead of popping in.
+* Trails fade all the way to nothing, so the last glyph no longer blinks out.
+* The flicker of glyphs inside the trails runs at the same rate whatever the refresh rate.
+* Color rotation follows the same clock, so it never stutters.
+
+The look is the same: glyphs still sit in their columns and change in place, as in the film.
 
 ## What's new in 1.1.1 (11-08-2026)
 
